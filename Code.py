@@ -4,31 +4,26 @@ def read_and_convert(dat_file, csv_file, delimiter='¸'):
     with open(dat_file, 'r', encoding='utf-8') as infile, open(csv_file, 'w', newline='', encoding='utf-8') as outfile:
         writer = csv.writer(outfile)
         
-        current_record = []  # Holds the current record being processed
-        num_columns = None   # Number of columns to expect (inferred from the first complete record)
+        current_record = []  # To store fields of the current record
 
         for line in infile:
-            # Strip newline characters and leading/trailing spaces
+            # Strip leading/trailing whitespace, including newlines
             stripped_line = line.strip()
             
             # Skip empty lines
             if not stripped_line:
                 continue
-
-            # Split the line into fields based on the delimiter
-            fields = stripped_line.split(delimiter)
-
-            # Initialize number of columns based on the first record
-            if num_columns is None:
-                num_columns = len(fields)
-
-            # If the current record is incomplete, append this line's fields
-            if len(current_record) + len(fields) <= num_columns:
-                current_record.extend(fields)
-            else:
-                # Write the completed record to the CSV
+            
+            # If the line does not end with the delimiter, it's a continuation of the current record
+            if not stripped_line.endswith(delimiter):
+                # Add the line to the current record, replacing newlines with spaces if needed
+                current_record.append(stripped_line)
+                # Write the complete record to the CSV
                 writer.writerow(current_record)
-                current_record = fields  # Start a new record
+                current_record = []  # Reset for the next record
+            else:
+                # Line ends with a delimiter, so it's part of the same record
+                current_record.append(stripped_line[:-1])  # Remove the trailing delimiter
 
         # Write the last record if it exists
         if current_record:
