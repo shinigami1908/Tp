@@ -1,41 +1,49 @@
-import csv
+import requests
+from requests.auth import HTTPBasicAuth
 
-def convert_dat_to_csv(dat_file, csv_file, expected_columns, delimiter='¸'):
-    with open(dat_file, 'r', encoding='utf-8') as infile, open(csv_file, 'w', newline='', encoding='utf-8') as outfile:
-        writer = csv.writer(outfile)
-        
-        current_record = []  # To accumulate parts of a single record
+# Config
+JIRA_DOMAIN = "your-domain.atlassian.net"
+EMAIL = "your-email@example.com"
+API_TOKEN = "your-api-token"
+PROJECT_KEY = "ABC"  # Your specific project
+FIX_VERSION_NAME = "1.0.0"
 
-        for line in infile:
-            # Clean up leading/trailing spaces (but keep logical newline handling intact)
-            stripped_line = line.strip()
+BASE_URL = f"https://{JIRA_DOMAIN}"
+AUTH = HTTPBasicAuth(EMAIL, API_TOKEN)
+HEADERS = {"Accept": "application/json"}
 
-            # Skip empty lines
-            if not stripped_line:
-                continue
+def search_issues_by_fix_version(project_key, fix_version):
+    jql = f'project = "{project_key}" AND fixVersion = "{fix_version}"'
+    url = f"{BASE_URL}/rest/api/2/search"
+    start_at = 0
+    max_results = 50
+    issues = []
 
-            # Count the number of delimiters in the line
-            delimiter_count = stripped_line.count(delimiter)
+    while True:
+        params = {
+            "jql": jql,
+            "startAt": start_at,
+            "maxResults": max_results,
+            "fields": "key,summary,status,assignee"
+        }
+        response = requests.get(url, headers=HEADERS, auth=AUTH, params=params)
+        response.raise_for_status()
+        data = response.json()
+        issues.extend(data["issues"])
+        if start_at + max_results >= data["total"]:
+            break
+        start_at += max_results
 
-            # Append the current line to the ongoing record
-            current_record.append(stripped_line)
+    return issues
 
-            # If the delimiter count matches expected_columns - 1, the record is complete
-            if delimiter_count == expected_columns - 1:
-                # Combine the accumulated lines into a single record
-                full_record = delimiter.join(current_record)
-                fields = full_record.split(delimiter)
+# Run
+issues = search_issues_by_fix_version(PROJECT_KEY, FIX_VERSION_NAME)
 
-                # Write the complete record to the CSV file
-                writer.writerow(fields)
-
-                # Reset for the next record
-                current_record = []
-
-        # Handle any leftover record (in case the file ends with an incomplete newline)
-        if current_record:
-            full_record = delimiter.join(current_record)
-            fields = full_record.split(delimiter)
-            writer.writerow(fields)
-
-    print(f"Converted {dat_file} to {csv_file} successfully!")
+# Output
+print(f"Found {len(issues)} issues in project '{PROJECT_KEY}' with Fix Version '{FIX_VERSION_NAME}':")
+for issue in issues:
+    key = issue["key"]
+    summary = issue["fields"]["summary"]
+    status = issue["fields"]["status"]["name"]
+    assignee = issue["fields"]["assignee"]["displayName"] if issue["fields"]["assignee"] else "Unassigned"
+    print(f"{key}: {summary} | Status: {status} | Assignee: {assignee}")
