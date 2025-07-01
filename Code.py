@@ -1,49 +1,136 @@
-import requests
-from requests.auth import HTTPBasicAuth
+import os, json, hashlib
+from atlassian import Confluence
+from tachyon import TachyonClient, Document
+from dotenv import load_dotenv
 
-# Config
-JIRA_DOMAIN = "your-domain.atlassian.net"
-EMAIL = "your-email@example.com"
-API_TOKEN = "your-api-token"
-PROJECT_KEY = "ABC"  # Your specific project
-FIX_VERSION_NAME = "1.0.0"
+load_dotenv()
 
-BASE_URL = f"https://{JIRA_DOMAIN}"
-AUTH = HTTPBasicAuth(EMAIL, API_TOKEN)
-HEADERS = {"Accept": "application/json"}
+CONFLUENCE_URL = os.getenv("CONFLUENCE_URL")
+CONFLUENCE_USERNAME = os.getenv("CONFLUENCE_USERNAME")
+CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN")
+SPACE_KEY = os.getenv("CONFLUENCE_SPACE_KEY")
+TACHYON_API_KEY = os.getenv("TACHYON_API_KEY")
 
-def search_issues_by_fix_version(project_key, fix_version):
-    jql = f'project = "{project_key}" AND fixVersion = "{fix_version}"'
-    url = f"{BASE_URL}/rest/api/2/search"
-    start_at = 0
-    max_results = 50
-    issues = []
+STATE_FILE = "sync/state.json"
+os.makedirs("sync", exist_ok=True)
 
-    while True:
-        params = {
-            "jql": jql,
-            "startAt": start_at,
-            "maxResults": max_results,
-            "fields": "key,summary,status,assignee"
+confluence = Confluence(
+    url=CONFLUENCE_URL,
+    username=CONFLUENCE_USERNAME,
+    password=CONFLUENCE_API_TOKEN
+)
+tachyon = TachyonClient(api_key=TACHYON_API_KEY)
+
+
+def load_state():
+    return json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
+
+def save_state(state):
+    json.dump(state, open(STATE_FILE, "w"), indent=2)
+
+def clean_html(html):
+    import re
+    return re.sub('<[^<]+?>', '', html)
+
+def hash_content(text):
+    return hashlib.sha256(text.strip().encode()).hexdigest()
+
+def sync_confluence():
+    state = load_state()
+    updated = {}
+
+    pages = confluence.get_all_pages_from_space(SPACE_KEY, start=0, limit=1000, status='current')
+    updated_docs = []
+
+    for page in pages:
+        pid = page["id"]
+        title = page["title"]
+        updated_at = page["version"]["when"]
+        previous = state.get(pid, {})
+
+        if previous and previous["last_updated"] == updated_at:
+            updated[pid] = previous
+            continue
+
+        full = confluence.get_page_by_id(pid, expand="body.storage")
+        html = full["body"]["storage"]["value"]
+        text = clean_html(html)
+        content_hash = hash_content(text)
+
+        if previous and previous["hash"] == content_hash:
+            updated[pid] = previous
+            continue
+
+        url = f"{CONFLUENCE_URL}{page['_links']['webui']}"
+        doc = Document(
+            content=text,
+            metadata={
+                "title": title,
+                "url": url,
+                "page_id": pid,
+                "last_updated": updated_at
+            }
+        )
+        updated_docs.append(doc)
+
+        updated[pid] = {
+            "last_updated": updated_at,
+            "hash": content_hash
         }
-        response = requests.get(url, headers=HEADERS, auth=AUTH, params=params)
-        response.raise_for_status()
-        data = response.json()
-        issues.extend(data["issues"])
-        if start_at + max_results >= data["total"]:
-            break
-        start_at += max_results
 
-    return issues
+    if updated_docs:
+        print(f"Uploading {len(updated_docs)} updated documents...")
+        tachyon.upload_documents(updated_docs)
+    else:
+        print("No changes detected.")
 
-# Run
-issues = search_issues_by_fix_version(PROJECT_KEY, FIX_VERSION_NAME)
+    save_state(updated)
 
-# Output
-print(f"Found {len(issues)} issues in project '{PROJECT_KEY}' with Fix Version '{FIX_VERSION_NAME}':")
-for issue in issues:
-    key = issue["key"]
-    summary = issue["fields"]["summary"]
-    status = issue["fields"]["status"]["name"]
-    assignee = issue["fields"]["assignee"]["displayName"] if issue["fields"]["assignee"] else "Unassigned"
-    print(f"{key}: {summary} | Status: {status} | Assignee: {assignee}")
+
+
+
+
+
+
+from tachyon import TachyonClient
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+client = TachyonClient(api_key=os.getenv("TACHYON_API_KEY"))
+
+def ask_question(question: str):
+    response = client.query(question, top_k=5)
+    answer = response.generated_answer
+    sources = [
+        {"title": doc.metadata.get("title"), "url": doc.metadata.get("url")}
+        for doc in response.source_documents
+    ]
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+
+
+
+
+
+from sync.confluence_sync import sync_confluence
+from tachyon.query_engine import ask_question
+
+# 1. Run sync
+sync_confluence()
+
+# 2. Ask a question
+query = "How do I configure VPN access?"
+result = ask_question(query)
+
+print("Answer:")
+print(result["answer"])
+print("\nSources:")
+for src in result["sources"]:
+    print(f"- {src['title']}: {src['url']}")
+
+
+
+
