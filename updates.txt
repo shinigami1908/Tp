@@ -1,135 +1,3 @@
-1) src/common/config.py (updated)
-
-# src/common/config.py
-from pathlib import Path
-import os
-
-BASE_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "mockdata"))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", BASE_DIR / "output"))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# reference image (from uploads) - kept as local path to be transformed as needed
-REFERENCE_IMAGE = Path("/mnt/data/IMG_8121.jpeg")
-
-# expected files (exact names as in your mockdata)
-FILES = {
-    "employees": "employees.csv",
-    "defects": "defects.csv",
-    "feedback_360": "feedback_360.csv",
-    "github_metrics": "github_metrics.csv",
-    "idp_goals": "idp_goals.csv",
-    "jira_metrics": "jira_metrics.csv",
-    "lms_completions": "lms_completions.csv",
-    "manager_evaluations": "manager_evaluations.csv",
-    "recognition": "recognition.csv",
-    "red_flag_dictionary": "red_flag_dictionary.csv",
-    "release_metrics": "release_metrics.csv",
-    "rto": "rto.csv",
-    "workday_checkins": "workday_checkins.csv"
-}
-
-# Exact column map (uses exact headers you provided; no automatic renaming)
-COLUMN_MAP = {
-    "employees": {
-        "employee_id": ["employee_id"],
-        "name": ["name"],
-        "role": ["role"],
-        "manager_id": ["manager_id"],
-        "org": ["org"]
-    },
-    "defects": {
-        "employee_id": ["employee_id"],
-        "date": ["date"],
-        "severity": ["severity"],
-        "escaped_to_prod": ["escaped_to_prod"],
-        "found_in": ["found_in"]
-    },
-    "feedback_360": {
-        "employee_id": ["employee_id"],
-        "date": ["date"],
-        "rater_role": ["rater_role"],
-        "sentiment": ["sentiment"],
-        "comment": ["comment"]
-    },
-    "github_metrics": {
-        "employee_id": ["employee_id"],
-        "month": ["month"],
-        "commits": ["commits"],
-        "pull_requests": ["pull_requests"],
-        "reviews_done": ["reviews_done"],
-        "copilot_suggestions_accepted": ["copilot_suggestions_accepted"],
-        "copilot_suggestions_total": ["copilot_suggestions_total"]
-    },
-    "idp_goals": {
-        "employee_id": ["employee_id"],
-        "goal": ["goal"],
-        "target_date": ["target_date"],
-        "status": ["status"]
-    },
-    "jira_metrics": {
-        "employee_id": ["employee_id"],
-        "sprint": ["sprint"],
-        "story_points_committed": ["story_points_committed"],
-        "story_points_completed": ["story_points_completed"],
-        "spillover_points": ["spillover_points"],
-        "bugs_introduced": ["bugs_introduced"],
-        "bugs_fixed": ["bugs_fixed"]
-    },
-    "lms_completions": {
-        "employee_id": ["employee_id"],
-        "course_id": ["course_id"],
-        "course_name": ["course_name"],
-        "hours": ["hours"],
-        "score": ["score"],
-        "completion_date": ["completion_date"]
-    },
-    "manager_evaluations": {
-        "employee_id": ["employee_id"],
-        "period": ["period"],
-        "rating": ["rating"],
-        "bias_type": ["bias_type"],
-        "bias_notes": ["bias_notes"],
-        "manager_comment": ["manager_comment"],
-        "areas_of_focus": ["areas_of_focus"]
-    },
-    "recognition": {
-        "employee_id": ["employee_id"],
-        "date": ["date"],
-        "type": ["type"],
-        "from": ["from"],  # keep exact CSV column name 'from'
-        "message": ["message"]
-    },
-    "red_flag_dictionary": {
-        "red_flag_term": ["red_flag_term"],
-        "description": ["description"]
-    },
-    "release_metrics": {
-        "employee_id": ["employee_id"],
-        "release_id": ["release_id"],
-        "defect_rate_ppm": ["defect_rate_ppm"],
-        "on_time": ["on_time"],
-        "rollbacks": ["rollbacks"]
-    },
-    "rto": {
-        "employee_id": ["employee_id"],
-        "month": ["month"],
-        "required_days": ["required_days"],
-        "in_office_days": ["in_office_days"],
-        "compliant": ["compliant"]
-    },
-    "workday_checkins": {
-        "employee_id": ["employee_id"],
-        "period": ["period"],
-        "date": ["date"],
-        "type": ["type"],
-        "summary": ["summary"],
-        "sentiment": ["sentiment"]
-    }
-}
-
-2) src/common/data_loader.py (updated)
-
 # src/common/data_loader.py
 import pandas as pd
 from pathlib import Path
@@ -152,37 +20,79 @@ def _read_csv_if_exists(fname):
         except Exception as e2:
             log.error(f"Failed to read {p}: {e2}")
             return None
-    # normalize column names to safe form (lowercase underscore) for robust access
+    # strip whitespace from headers
     df.columns = df.columns.str.strip()
-    # keep exact headers but also create a safe-lowercase copy for lookups
-    df.columns = [c for c in df.columns]  # preserve exact spelling, case kept (we will look for exact)
+    # preserve exact header spelling/case (we will look up using exact names from config)
+    df.columns = [c for c in df.columns]
     # ensure employee_id is string if present
     if 'employee_id' in df.columns:
         df['employee_id'] = df['employee_id'].astype(str)
     return df
+
+def find_column(df, candidates):
+    """
+    Given a DataFrame and a list of candidate column names (in priority order),
+    return the first matching column name that exists in df.columns.
+    Matching strategy:
+      1. exact match (case-sensitive)
+      2. case-insensitive match
+      3. substring match (case-insensitive) - returns the first column that contains the candidate token
+    Returns the matching column name (as it appears in df.columns) or None.
+    """
+    if df is None:
+        return None
+    cols = list(df.columns)
+
+    # 1) exact match
+    for c in candidates:
+        if c in cols:
+            return c
+
+    # 2) case-insensitive exact
+    lower_map = {col.lower(): col for col in cols}
+    for c in candidates:
+        lc = c.lower()
+        if lc in lower_map:
+            return lower_map[lc]
+
+    # 3) substring match (candidate token in column name)
+    for c in candidates:
+        token = c.lower()
+        for col in cols:
+            if token in col.lower():
+                return col
+
+    # 4) more permissive: try token split on underscores/space pairs
+    for c in candidates:
+        parts = [p for p in c.replace('-', ' ').replace('.', ' ').split() if p]
+        if not parts:
+            continue
+        for col in cols:
+            cl = col.lower()
+            if all(part.lower() in cl for part in parts):
+                return col
+
+    return None
 
 def parse_dates_and_types(key, df):
     """Parse known date/month/boolean columns based on key using COLUMN_MAP and rules."""
     if df is None:
         return df
     df = df.copy()
-    # employees: no date parsing
     try:
         if key == "defects":
             if 'date' in df.columns:
                 df['date'] = pd.to_datetime(df['date'], format="%m/%d/%Y", errors='coerce')
-            # normalize escaped_to_prod to boolean
             if 'escaped_to_prod' in df.columns:
                 df['escaped_to_prod'] = df['escaped_to_prod'].apply(lambda x: str(x).strip().lower() in ("1","true","yes","y","t"))
         elif key == "feedback_360":
             if 'date' in df.columns:
                 df['date'] = pd.to_datetime(df['date'], format="%m/%d/%Y", errors='coerce')
-            # sentiment is string in your schema; keep as-is
+            # sentiment is string (positive/constructive/mixed) — leave as-is
         elif key == "github_metrics":
             if 'month' in df.columns:
                 # month is YYYY-MM
                 df['month'] = pd.to_datetime(df['month'].astype(str) + "-01", format="%Y-%m-%d", errors='coerce')
-            # numeric columns
             for c in ['commits','pull_requests','reviews_done','copilot_suggestions_accepted','copilot_suggestions_total']:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
@@ -190,7 +100,6 @@ def parse_dates_and_types(key, df):
             if 'target_date' in df.columns:
                 df['target_date'] = pd.to_datetime(df['target_date'], format="%m/%d/%Y", errors='coerce')
         elif key == "jira_metrics":
-            # no date parse for sprint; numeric columns:
             for c in ['story_points_committed','story_points_completed','spillover_points','bugs_introduced','bugs_fixed']:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
@@ -222,7 +131,6 @@ def parse_dates_and_types(key, df):
         elif key == "workday_checkins":
             if 'date' in df.columns:
                 df['date'] = pd.to_datetime(df['date'], format="%m/%d/%Y", errors='coerce')
-            # sentiment kept as string per schema (positive/constructive/mixed)
     except Exception as e:
         log.warning(f"parse_dates_and_types: problem parsing types for {key}: {e}")
     return df
@@ -234,524 +142,3 @@ def load_all():
         df = parse_dates_and_types(key, df)
         loaded[key] = df
     return loaded
-
-3) src/etl/periodizer.py (new)
-
-# src/etl/periodizer.py
-import pandas as pd
-from ..common.logger import get_logger
-
-log = get_logger("periodizer")
-
-def compute_period_half_from_date(val):
-    try:
-        ts = pd.to_datetime(val, errors="coerce")
-        if pd.isna(ts):
-            return None
-        yr = ts.year
-        mon = ts.month
-        return f"{yr}H1" if mon <= 6 else f"{yr}H2"
-    except Exception:
-        return None
-
-def compute_period_half_from_month(val):
-    try:
-        if pd.isna(val):
-            return None
-        s = str(val).strip()
-        if "-" in s:
-            parts = s.split("-")
-            if len(parts) >= 2 and len(parts[0]) == 4:
-                yr = int(parts[0])
-                mon = int(parts[1])
-                return f"{yr}H1" if mon <= 6 else f"{yr}H2"
-        ts = pd.to_datetime(s, errors="coerce")
-        if not pd.isna(ts):
-            yr = ts.year
-            mon = ts.month
-            return f"{yr}H1" if mon <= 6 else f"{yr}H2"
-    except Exception:
-        pass
-    return None
-
-def attach_period_half(df, key_hint=None):
-    """
-    Attaches a 'period_half' column to df using available columns:
-      - if 'period' exists and is 'H1'/'H2', attempt to infer year from date-like cols
-      - if 'month' exists (YYYY-MM), compute half-year
-      - if 'date' exists (MM/DD/YYYY), compute half-year
-      - fallback: 'H1'/'H2' without year or 'unknown'
-    """
-    if df is None or df.empty:
-        return df
-    df = df.copy()
-
-    def infer_year_from_row(row):
-        # candidate date columns to check for year
-        for c in ['date', 'completion_date', 'created_date', 'resolved_date', 'month', 'timestamp', 'target_date']:
-            if c in row.index and pd.notna(row[c]):
-                try:
-                    ts = pd.to_datetime(row[c], errors="coerce")
-                    if not pd.isna(ts):
-                        return ts.year
-                except Exception:
-                    continue
-        return None
-
-    def row_period(r):
-        # 1) explicit period column (H1/H2) — try to attach a year
-        if 'period' in r.index and pd.notna(r['period']):
-            p = str(r['period']).strip().upper()
-            if p in ('H1', 'H2'):
-                yr = infer_year_from_row(r)
-                if yr:
-                    return f"{yr}{p}"
-                return p  # keep H1/H2 if no year
-        # 2) month -> YYYY-MM
-        if 'month' in r.index and pd.notna(r['month']):
-            res = compute_period_half_from_month(r['month'])
-            if res:
-                return res
-        # 3) date-like columns
-        for c in ['date','completion_date','created_date','resolved_date','target_date','timestamp']:
-            if c in r.index and pd.notna(r[c]):
-                res = compute_period_half_from_date(r[c])
-                if res:
-                    return res
-        return 'unknown'
-
-    df['period_half'] = df.apply(row_period, axis=1)
-    return df
-
-4) src/etl/merger.py (updated)
-
-# src/etl/merger.py
-import pandas as pd
-from ..common.logger import get_logger
-
-log = get_logger("merger")
-
-def prefix_df(df, prefix):
-    """Return a copy where non-key columns are prefixed to avoid collisions."""
-    if df is None:
-        return None
-    df = df.copy()
-    cols = df.columns.tolist()
-    new_cols = {}
-    for c in cols:
-        if c != 'employee_id':
-            new_cols[c] = f"{prefix}_{c}"
-    df = df.rename(columns=new_cols)
-    return df
-
-def left_merge_on_employee(base_df, other_df, other_prefix):
-    if other_df is None or other_df.empty:
-        return base_df
-    odf = other_df.copy()
-    # ensure employee_id exists - it should per your instruction
-    if 'employee_id' not in odf.columns:
-        # try fallback names but do not rename files permanently
-        fallbacks = ['assignee_id', 'receiver_id', 'assignee']
-        for f in fallbacks:
-            if f in odf.columns:
-                odf = odf.rename(columns={f: 'employee_id'})
-                log.info(f"Fallback rename {f} -> employee_id for merging (prefix {other_prefix})")
-                break
-    odf_prefixed = prefix_df(odf, other_prefix)
-    # merge on employee_id (both sides)
-    merged = base_df.merge(odf_prefixed, left_on='employee_id', right_on='employee_id', how='left')
-    return merged
-
-def pick_period_half_from_row(row):
-    # precedence: manager_evaluations' period_half (no prefix) then prefixed ones
-    candidates = [
-        'period_half',
-        'manager_evaluations_period_half',
-        'jira_period_half',
-        'wd_period_half',
-        'fb_period_half',
-        'release_period_half',
-        'lms_period_half',
-        'rto_period_half'
-    ]
-    for c in candidates:
-        if c in row and pd.notna(row[c]) and row[c] != 'unknown':
-            return row[c]
-    # fallback: if any 'xxx_period_half' exists with meaningful value, return it
-    for k in row.index:
-        if k.endswith('_period_half') and pd.notna(row[k]) and row[k] != 'unknown':
-            return row[k]
-    return 'unknown'
-
-def build_joined(loaded):
-    mgr = loaded.get('manager_evaluations')
-    emp = loaded.get('employees')
-    jira = loaded.get('jira_metrics')
-    release = loaded.get('release_metrics')
-    defects = loaded.get('defects')
-    feedback = loaded.get('feedback_360')
-    idp = loaded.get('idp_goals')
-    rto = loaded.get('rto')
-    recognition = loaded.get('recognition')
-    github = loaded.get('github_metrics')
-    workday = loaded.get('workday_checkins')
-    lms = loaded.get('lms_completions')
-
-    base = mgr.copy() if mgr is not None else (emp.copy() if emp is not None else pd.DataFrame())
-    # ensure employee_id on base
-    if 'employee_id' not in base.columns and emp is not None and 'employee_id' in emp.columns:
-        base = base.merge(emp[['employee_id']], left_index=True, right_index=False, how='left')
-
-    base = left_merge_on_employee(base, emp, 'emp')
-    base = left_merge_on_employee(base, jira, 'jira')
-    base = left_merge_on_employee(base, release, 'release')
-    base = left_merge_on_employee(base, defects, 'defects')
-    base = left_merge_on_employee(base, feedback, 'fb')
-    base = left_merge_on_employee(base, idp, 'idp')
-    base = left_merge_on_employee(base, rto, 'rto')
-    base = left_merge_on_employee(base, recognition, 'recog')
-    base = left_merge_on_employee(base, github, 'gh')
-    base = left_merge_on_employee(base, workday, 'wd')
-    base = left_merge_on_employee(base, lms, 'lms')
-
-    # compute canonical period_half for the joined row
-    merged = base.copy()
-    merged['period_half'] = merged.apply(pick_period_half_from_row, axis=1)
-    return merged
-
-5) src/etl/etl_pipeline.py (updated)
-
-# src/etl/etl_pipeline.py
-from ..common.data_loader import load_all
-from .cleaner import normalize_manager_evaluations, normalize_employees
-from .merger import build_joined
-from .periodizer import attach_period_half
-from ..common.config import OUTPUT_DIR
-from ..common.logger import get_logger
-from ..features.feature_engineering import compute_kpis
-
-log = get_logger("etl_pipeline")
-
-def run_etl():
-    loaded = load_all()
-
-    # Normalize critical tables (assumes these functions exist)
-    try:
-        loaded['manager_evaluations'] = normalize_manager_evaluations(loaded.get('manager_evaluations'))
-    except Exception:
-        log.info("normalize_manager_evaluations not available or failed - proceeding with raw data")
-    try:
-        loaded['employees'] = normalize_employees(loaded.get('employees'))
-    except Exception:
-        log.info("normalize_employees not available or failed - proceeding with raw data")
-
-    # Attach period_half to each table
-    for key in list(loaded.keys()):
-        df = loaded.get(key)
-        if df is None:
-            continue
-        try:
-            loaded[key] = attach_period_half(df, key_hint=key)
-            log.info(f"Attached period_half to {key}")
-        except Exception as e:
-            log.warning(f"Could not attach period_half for {key}: {e}")
-
-    # Build joined
-    joined = build_joined(loaded)
-    out_path = OUTPUT_DIR / 'joined_evals.csv'
-    joined.to_csv(out_path, index=False)
-    log.info(f'Wrote joined_evals to {out_path}')
-
-    # compute features (returns combined and per-period)
-    combined, by_period = compute_kpis(joined)
-
-    # save additional artifacts (compute_kpis writes files but ensure variables are present)
-    # compute_kpis will write features.csv and features_by_period.csv internally
-
-    return {
-        "loaded": loaded,
-        "joined": joined,
-        "features_combined": combined,
-        "features_by_period": by_period
-    }
-
-6) src/features/feature_engineering.py (updated)
-
-# src/features/feature_engineering.py
-import pandas as pd
-import numpy as np
-from ..common.logger import get_logger
-from ..common.config import OUTPUT_DIR
-
-log = get_logger("feature_engineering")
-
-def compute_kpis(joined):
-    """
-    Compute KPIs per employee per period_half AND combined per employee.
-    Writes:
-      - output/features_by_period.csv
-      - output/features.csv (combined)
-    Returns combined_df, by_period_df
-    """
-    df = joined.copy()
-
-    # ensure key numeric columns exist (create defaults if missing)
-    numeric_defaults = {
-        'story_points_committed': 0,
-        'story_points_completed': 0,
-        'spillover_points': 0,
-        'defect_count': 0,
-        'recognitions': 0,
-        'feedback_sentiment': np.nan,
-        'copilot_acceptance_pct': np.nan,
-        'rto_compliant_flag': np.nan,
-        'release_defect_ppm': np.nan,
-        'release_on_time_percent': np.nan
-    }
-
-    # map defect_count heuristics: if defects_defect_count or defects.bugs_* exist, pick them
-    if 'defect_count' not in df.columns:
-        # try defects columns prefixed in joined
-        for c in df.columns:
-            if 'defects_' in c and ('severity' in c or 'count' in c or 'bug' in c):
-                df['defect_count'] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-                break
-        else:
-            df['defect_count'] = 0
-
-    # ensure jira columns are present (possibly prefixed after merge)
-    for col in ['story_points_completed', 'story_points_committed', 'spillover_points']:
-        if col not in df.columns:
-            # try prefixed jira_ columns
-            if f'jira_{col}' in df.columns:
-                df[col] = pd.to_numeric(df[f'jira_{col}'], errors='coerce').fillna(0)
-            else:
-                df[col] = 0
-
-    # recognition heuristics
-    if 'recognitions' not in df.columns:
-        # attempt to count non-null messages in prefixed recognition columns
-        recog_cols = [c for c in df.columns if c.startswith('recog_') and ('message' in c or 'type' in c)]
-        if recog_cols:
-            df['recognitions'] = df[recog_cols].notna().sum(axis=1)
-        else:
-            df['recognitions'] = 0
-
-    # feedback sentiment (string). For now map: positive->1, constructive->0.5, mixed->0
-    if 'feedback_sentiment' not in df.columns:
-        if 'sentiment' in df.columns:
-            mapping = {'positive': 1.0, 'constructive': 0.5, 'mixed': 0.0}
-            df['feedback_sentiment'] = df['sentiment'].map(lambda x: mapping.get(str(x).strip().lower(), np.nan) if pd.notna(x) else np.nan)
-        else:
-            df['feedback_sentiment'] = np.nan
-
-    # copilot acceptance
-    if 'copilot_suggestions_accepted' in df.columns:
-        df['copilot_acceptance_pct'] = pd.to_numeric(df['copilot_suggestions_accepted'], errors='coerce').fillna(0)
-    elif 'copilot_suggestions_total' in df.columns and 'copilot_suggestions_accepted' in df.columns:
-        # compute pct if both present (avoid divide-by-zero)
-        df['copilot_acceptance_pct'] = pd.to_numeric(df['copilot_suggestions_accepted'], errors='coerce').fillna(0)
-    elif 'gh_copilot_acceptance_pct' in df.columns:
-        df['copilot_acceptance_pct'] = pd.to_numeric(df['gh_copilot_acceptance_pct'], errors='coerce').fillna(0)
-    else:
-        df['copilot_acceptance_pct'] = np.nan
-
-    # RTO compliance flag
-    if 'compliant' in df.columns:
-        df['rto_compliant_flag'] = df['compliant'].apply(lambda x: 1.0 if str(x).strip().lower() in ("1","true","yes","y") else 0.0 if pd.notna(x) else np.nan)
-    elif 'rto_compliant_flag' not in df.columns:
-        df['rto_compliant_flag'] = np.nan
-
-    # release metrics
-    if 'defect_rate_ppm' in df.columns:
-        df['release_defect_ppm'] = pd.to_numeric(df['defect_rate_ppm'], errors='coerce').fillna(np.nan)
-    elif 'release_defect_ppm' in df.columns:
-        df['release_defect_ppm'] = pd.to_numeric(df['release_defect_ppm'], errors='coerce').fillna(np.nan)
-    else:
-        df['release_defect_ppm'] = np.nan
-
-    if 'on_time' in df.columns:
-        # on_time is boolean 0/1 per your schema. compute percent later.
-        df['release_on_time_percent'] = df['on_time'].apply(lambda x: 100.0 if str(x).strip() in ("1","True","true","YES","yes","Y","y") else 0.0 if pd.notna(x) else np.nan)
-    else:
-        df['release_on_time_percent'] = np.nan
-
-    # ensure period_half exists
-    if 'period_half' not in df.columns:
-        df['period_half'] = 'unknown'
-
-    # Group by employee_id & period_half
-    group_cols = ['employee_id', 'period_half']
-
-    agg_spec = {
-        'story_points_completed': 'sum',
-        'story_points_committed': 'sum',
-        'spillover_points': 'sum',
-        'defect_count': 'sum',
-        'recognitions': 'sum',
-        'feedback_sentiment': 'mean',
-        'copilot_acceptance_pct': 'mean',
-        'rto_compliant_flag': 'mean',
-        'release_defect_ppm': 'mean',
-        'release_on_time_percent': 'mean'
-    }
-
-    grouped = df.groupby(group_cols).agg(agg_spec).reset_index()
-
-    # Derived KPIs
-    grouped['velocity'] = grouped['story_points_completed']
-    grouped['spillover_pct'] = np.where(
-        (grouped['story_points_committed'] + grouped['spillover_points']) > 0,
-        grouped['spillover_points'] / (grouped['story_points_committed'] + grouped['spillover_points']),
-        0.0
-    )
-    grouped['defect_density_per_100_sp'] = np.where(
-        grouped['story_points_completed'] > 0,
-        (grouped['defect_count'] / grouped['story_points_completed']) * 100.0,
-        0.0
-    )
-    grouped['recognition_rate'] = grouped['recognitions']
-    grouped['rto_compliance_pct'] = grouped['rto_compliant_flag'] * 100.0
-
-    # Save per-period features
-    out_period = OUTPUT_DIR / 'features_by_period.csv'
-    grouped.to_csv(out_period, index=False)
-    log.info(f'Wrote per-period features to {out_period}')
-
-    # Combined aggregated (all periods) per employee
-    combined = grouped.groupby('employee_id').agg({
-        'story_points_completed': 'sum',
-        'story_points_committed': 'sum',
-        'spillover_points': 'sum',
-        'defect_count': 'sum',
-        'recognitions': 'sum',
-        'feedback_sentiment': 'mean',
-        'copilot_acceptance_pct': 'mean',
-        'rto_compliant_flag': 'mean',
-        'release_defect_ppm': 'mean',
-        'release_on_time_percent': 'mean'
-    }).reset_index()
-
-    combined['velocity'] = combined['story_points_completed']
-    combined['spillover_pct'] = np.where(
-        (combined['story_points_committed'] + combined['spillover_points']) > 0,
-        combined['spillover_points'] / (combined['story_points_committed'] + combined['spillover_points']),
-        0.0
-    )
-    combined['defect_density_per_100_sp'] = np.where(
-        combined['story_points_completed'] > 0,
-        (combined['defect_count'] / combined['story_points_completed']) * 100.0,
-        0.0
-    )
-    combined['recognition_rate'] = combined['recognitions']
-    combined['rto_compliance_pct'] = combined['rto_compliant_flag'] * 100.0
-
-    out_combined = OUTPUT_DIR / 'features.csv'
-    combined.to_csv(out_combined, index=False)
-    log.info(f'Wrote combined features to {out_combined}')
-
-    return combined, grouped
-
-7) src/webapp/streamlit_app.py (updated portions only)
-
-# src/webapp/streamlit_app.py
-import streamlit as st
-import pandas as pd
-import json
-from pathlib import Path
-from ..common.config import OUTPUT_DIR, REFERENCE_IMAGE
-from ..common.logger import get_logger
-
-log = get_logger('streamlit')
-st.set_page_config(page_title='AI Performance Assistant', layout='wide')
-
-joined_p = OUTPUT_DIR / 'joined_evals.csv'
-features_p = OUTPUT_DIR / 'features.csv'
-features_period_p = OUTPUT_DIR / 'features_by_period.csv'
-sug_p = OUTPUT_DIR / 'gpt_suggestions_postprocessed.json'
-
-joined = pd.read_csv(joined_p) if joined_p.exists() else pd.DataFrame()
-features = pd.read_csv(features_p) if features_p.exists() else pd.DataFrame()
-features_period = pd.read_csv(features_period_p) if features_period_p.exists() else pd.DataFrame()
-sugs = json.load(open(sug_p)) if sug_p.exists() else []
-
-st.title('AI Performance Assistant — Demo')
-
-if joined.empty:
-    st.warning('No joined_evals.csv found. Run the ETL pipeline first (python main.py).')
-else:
-    left, right = st.columns([2,3])
-    with left:
-        st.header('Team')
-        display_cols = ['employee_id']
-        if 'name' in joined.columns:
-            display_cols.append('name')
-        if 'role' in joined.columns:
-            display_cols.append('role')
-        display = joined[display_cols].drop_duplicates().reset_index(drop=True)
-        sel = st.selectbox('Select employee', display['employee_id'].tolist())
-        st.dataframe(display)
-    with right:
-        st.header('Employee Details')
-        row = joined[joined['employee_id']==sel].iloc[0]
-        st.subheader(f"{row.get('name', sel)} — {row.get('role','N/A')}")
-        st.write('Manager comment:', row.get('manager_comment','(none)'))
-        # Bias panel
-        st.subheader('Bias & Fairness')
-        bias_type = row.get('bias_type')
-        bias_notes = row.get('bias_notes')
-        if bias_type or bias_notes:
-            st.error(f"Bias detected: {bias_type if bias_type else ''} {': ' + bias_notes if bias_notes else ''}")
-        else:
-            st.success('No explicit bias fields found.')
-
-        # Period selector
-        periods = ['All']
-        if not features_period.empty:
-            # ensure period strings are sorted (descending)
-            periods += sorted(features_period['period_half'].unique().tolist(), reverse=True)
-        sel_period = st.selectbox('Select period', periods)
-
-        # show KPIs
-        st.subheader('KPIs')
-        display_show_cols = ['velocity','spillover_pct','defect_density_per_100_sp','recognition_rate','sentiment','copilot_acceptance_pct','rto_compliance_pct','release_on_time_percent','release_defect_ppm']
-        if sel_period == 'All':
-            f = features[features['employee_id']==sel]
-            if not f.empty:
-                # display single combined row
-                st.table(f[display_show_cols].T)
-            else:
-                st.info('No combined KPIs available for this employee.')
-        else:
-            f = features_period[(features_period['employee_id']==sel) & (features_period['period_half']==sel_period)]
-            if not f.empty:
-                st.table(f[display_show_cols].T)
-            else:
-                st.info(f'No data for employee {sel} in period {sel_period}.')
-
-        # show suggestions
-        emp_sug = next((x for x in sugs if x.get('employee_id')==sel), None)
-        if emp_sug:
-            st.subheader('AI suggestions')
-            candidates = emp_sug['suggestions'].get('candidates') if isinstance(emp_sug['suggestions'], dict) else None
-            if candidates:
-                for c in candidates:
-                    label = c.get('label','?')
-                    comment = c.get('comment','')
-                    st.markdown(f"**{label}** — {comment}")
-                    st.write('IDP:', c.get('idp','(none)'))
-                    st.write('Rationale:', c.get('rationale',[]))
-                    if c.get('red_flags'):
-                        st.warning('Red flags found in this generated comment: ' + ', '.join(c.get('red_flags')))
-            else:
-                st.info('No structured candidates found; raw model output may be present.')
-        else:
-            st.info('No suggestions available. Run generator.')
-
-    # optionally show reference image
-    with st.expander("Hackathon reference image"):
-        st.write(f"Reference image (for context): {REFERENCE_IMAGE}")
-        try:
-            st.image(str(REFERENCE_IMAGE))
-        except Exception:
-            st.info("Reference image not available in this environment.")
