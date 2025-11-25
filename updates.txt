@@ -1,22 +1,15 @@
 # src/features/feature_engineering.py
 """
-Feature engineering / KPI computation (stable + targeted fixes).
+Feature engineering / KPI computation (updated)
 
-Public API:
-    features_combined_df, features_by_period_df = compute_kpis(input)
-
-Design:
- - Uses the previously-working implementation you provided as the base.
- - Adds only the necessary fixes:
-     1) Ensure idp_goals overdue count is produced (idp_goals__overdue_count)
-     2) Prevent synthetic 'unknown' period rows from creating empty entries
-     3) Filter out missing/unknown employee_id rows when building keys
-     4) Preserve text columns (concats) as strings (no numeric coercion)
-     5) Merge employee role/org/name into features_combined_df
- - Keeps completion_ratio and other derived ratios; if source columns are missing,
-   these derived columns are created with a safe default (0.0) to avoid KeyError.
+- story_point_completion_ratio replaces completion_ratio
+- rto_compliance_rate computed as (in_office_days / required_days) * 100
+- boolean-like columns coerced to 0/1 before aggregation (escaped_to_prod, on_time, compliant)
+- improved numeric detection and preservation so combined file includes all numeric columns
+- idp_goals excluded from period-level output (only in combined)
+- idp_goals__overdue_count computed in combined (if not present earlier)
+- text concat fields preserved as strings
 """
-
 from typing import Dict, Tuple, List, Optional, Any
 import pandas as pd
 import numpy as np
@@ -27,17 +20,48 @@ import re
 log = get_logger("feature_engineering")
 
 NUMERIC_HINTS = {
-    "jira_metrics": ["story_points", "committed", "completed", "spillover", "bugs"],
-    "github_metrics": ["commits", "pull_requests", "reviews_done", "copilot"],
+    "jira_metrics": ["story_points", "committed", "completed", "spillover", "bugs", "story_points_committed", "story_points_completed"],
+    "github_metrics": ["commits", "pull_requests", "reviews_done", "copilot", "copilot_suggestions"],
     "defects": ["ppm", "rollbacks", "escaped_to_prod"],
-    "rto": ["required_days", "in_office_days", "compliant"],
+    "rto": ["required_days", "in_office_days", "compliant", "in_office_days"],
     "lms_completions": ["hours", "score"],
-    "release_metrics": ["defect_rate_ppm", "rollbacks"],
+    "release_metrics": ["defect_rate_ppm", "rollbacks", "on_time"],
     "idp_goals": [],
 }
 
 CATEGORICAL_EXPAND = ["severity", "sentiment", "status", "type", "rating", "bias_type"]
 
+# patterns used to detect text columns to preserve as strings
+TEXT_NAME_PATTERNS = re.compile(r"(concat|comment|message|summary|areas_of_focus|comments_concat|manager_comment)", flags=re.IGNORECASE)
+
+# boolean-like values to numeric
+def _bool_to_int_series(s: pd.Series) -> pd.Series:
+    """
+    Convert a series with boolean-like values (True/False, 'true','false','1','0') to 0/1 ints.
+    Non-convertible values become NaN (and will be filled as 0 by numeric pipeline).
+    """
+    if s is None:
+        return s
+    # Map common textual boolean representations
+    def map_val(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return np.nan
+        if isinstance(v, (bool, np.bool_)):
+            return 1 if v else 0
+        vs = str(v).strip().lower()
+        if vs in ("true", "t", "yes", "y", "1"):
+            return 1
+        if vs in ("false", "f", "no", "n", "0"):
+            return 0
+        # If numeric string
+        try:
+            iv = int(float(vs))
+            if iv in (0, 1):
+                return iv
+        except Exception:
+            pass
+        return np.nan
+    return s.apply(map_val)
 
 def _concat_texts(series: pd.Series, max_chars: int = 2000) -> str:
     try:
@@ -54,7 +78,6 @@ def _concat_texts(series: pd.Series, max_chars: int = 2000) -> str:
         return joined
     except Exception:
         return ""
-
 
 def _normalize_loaded_keys(loaded: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
     if not isinstance(loaded, dict):
@@ -74,8 +97,13 @@ def _normalize_loaded_keys(loaded: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
         out[nk] = v
     return out
 
-
 def _guess_numeric_cols(df: pd.DataFrame, hints: Optional[List[str]] = None) -> List[str]:
+    """
+    Improved numeric detection:
+      - Always include columns whose names match known numeric hints.
+      - Else try coercion over the whole column (not just small sample).
+      - If >=20% of full column coerces to numeric, treat as numeric.
+    """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return []
     hints = hints or []
@@ -83,43 +111,53 @@ def _guess_numeric_cols(df: pd.DataFrame, hints: Optional[List[str]] = None) -> 
     for c in df.columns:
         if c in ("employee_id", "period_half"):
             continue
+        lc = c.lower()
+        # name-based hint
+        if any(h in lc for h in hints):
+            cols.append(c)
+            continue
+        # boolean-like names
+        if any(x in lc for x in ("on_time", "escaped_to_prod", "compliant", "in_office", "rollbacks")):
+            cols.append(c)
+            continue
+        # check dtype
         if pd.api.types.is_numeric_dtype(df[c]):
             cols.append(c)
             continue
-        name = c.lower()
-        if any(h in name for h in hints):
-            cols.append(c)
-            continue
+        # try coercion across whole column
         try:
-            sample = df[c].astype(str).str.strip().replace({"": None, "nan": None, "NA": None, "N/A": None}).dropna().head(40)
-            if sample.empty:
-                continue
-            coerced = pd.to_numeric(sample, errors="coerce")
-            if coerced.notna().mean() >= 0.6:
+            coerced = pd.to_numeric(df[c].astype(str).replace({"": np.nan, "nan": np.nan, "NA": np.nan, "N/A": np.nan}), errors="coerce")
+            if coerced.notna().mean() >= 0.2:
                 cols.append(c)
         except Exception:
             continue
     return cols
 
-
 def _safe_numeric_sum_agg(df: pd.DataFrame, group_cols: List[str], numeric_cols: List[str]) -> pd.DataFrame:
+    """
+    Coerce numeric_cols to numeric (including boolean-like conversion) then sum per group.
+    """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty or not numeric_cols:
         return pd.DataFrame(columns=group_cols)
     d = df.copy()
     for c in numeric_cols:
         if c not in d.columns:
             continue
-        try:
-            d[c] = d[c].astype(str).str.strip().replace({"": None, "nan": None, "NA": None, "N/A": None})
-            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
-        except Exception:
+        # handle boolean-like explicitly
+        if c.lower().endswith("escaped_to_prod") or c.lower().endswith("on_time") or c.lower().endswith("compliant"):
             try:
-                d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+                d[c] = _bool_to_int_series(d[c])
             except Exception:
-                d[c] = 0
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+        else:
+            try:
+                d[c] = d[c].astype(str).str.strip().replace({"": None, "nan": None, "NA": None, "N/A": None})
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+            except Exception:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+        d[c] = d[c].fillna(0)
     agg = d.groupby(group_cols, dropna=False)[[c for c in numeric_cols if c in d.columns]].sum().reset_index()
     return agg
-
 
 def _expand_categorical_counts(df: pd.DataFrame, group_cols: List[str], cat_cols: List[str]) -> pd.DataFrame:
     present = [c for c in cat_cols if isinstance(df, pd.DataFrame) and c in df.columns]
@@ -142,13 +180,11 @@ def _expand_categorical_counts(df: pd.DataFrame, group_cols: List[str], cat_cols
                 agg[col] = pd.to_numeric(agg[col], errors="coerce").fillna(0).astype(int)
     return agg
 
-
 def _base_row_counts(df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame(columns=group_cols + ["_rows"])
     g = df.groupby(group_cols, dropna=False).size().reset_index().rename(columns={0: "_rows"})
     return g
-
 
 def _merge_prefix(df: pd.DataFrame, prefix: str, group_cols: List[str]) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -160,47 +196,48 @@ def _merge_prefix(df: pd.DataFrame, prefix: str, group_cols: List[str]) -> pd.Da
         out = out.rename(columns={c: f"{prefix}__{c}"})
     return out
 
-
 def _derive_safe_ratios(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Keep derived ratios; create safely with default 0 if source columns absent.
+    - story_point_completion_ratio (renamed)
+    - defect_escape_rate
+    - rto_compliance_rate = in_office_days / required_days * 100
+    - copilot_accept_ratio
     """
     df = merged.copy()
-
-    def safe_div(a, b):
+    def safe_div(a, b, scale=1.0):
         try:
             a = float(a) if a not in (None, "") else 0.0
             b = float(b) if b not in (None, "", 0, "0") else 0.0
             if b == 0:
                 return 0.0
-            return a / b
+            return (a / b) * scale
         except Exception:
             return 0.0
 
-    # completion_ratio: try to compute, else set 0.0 column so downstream code doesn't KeyError
+    # story_point_completion_ratio
     if "jira_metrics__story_points_completed" in df.columns or "jira_metrics__story_points_committed" in df.columns:
-        # ensure both present (treat missing as 0)
         comp_col = df.get("jira_metrics__story_points_completed", pd.Series(0, index=df.index))
         comm_col = df.get("jira_metrics__story_points_committed", pd.Series(0, index=df.index))
-        df["completion_ratio"] = [
+        df["story_point_completion_ratio"] = [
             safe_div(a, b) for a, b in zip(comp_col.fillna(0), comm_col.fillna(0))
         ]
     else:
-        df["completion_ratio"] = 0.0
+        df["story_point_completion_ratio"] = 0.0
 
-    # defect_escape_rate
+    # defect_escape_rate: escaped_to_prod as count / rows
     if "defects___rows" in df.columns and "defects__escaped_to_prod" in df.columns:
         df["defect_escape_rate"] = df.apply(
-            lambda r: safe_div(r.get("defects__escaped_to_prod", 0), r.get("defects___rows", 0)),
-            axis=1,
+            lambda r: safe_div(r.get("defects__escaped_to_prod", 0), r.get("defects___rows", 0)), axis=1
         )
     else:
         df["defect_escape_rate"] = 0.0
 
-    # rto_compliance_rate
-    if "rto__compliant" in df.columns and "rto__required_days" in df.columns:
+    # rto_compliance_rate: in_office_days / required_days * 100
+    if "rto__in_office_days" in df.columns and "rto__required_days" in df.columns:
         df["rto_compliance_rate"] = df.apply(
-            lambda r: safe_div(r.get("rto__compliant", 0), r.get("rto__required_days", 0)), axis=1
+            lambda r: safe_div(r.get("rto__in_office_days", 0), r.get("rto__required_days", 0), scale=100.0),
+            axis=1,
         )
     else:
         df["rto_compliance_rate"] = 0.0
@@ -217,10 +254,9 @@ def _derive_safe_ratios(merged: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
     """
-    Aggregate textual fields and sentiment/type counts for special tables.
+    For feedback_360, workday_checkins, manager_evaluations -> produce counts and concat texts
     """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame(columns=group_cols)
@@ -228,11 +264,9 @@ def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[
     for gc in group_cols:
         if gc not in d.columns:
             d[gc] = "unknown"
-
     results = _base_row_counts(d, group_cols)
     results = _merge_prefix(results, key, group_cols)
 
-    # feedback_360: sentiment counts + comments concat
     if key == "feedback_360":
         if "sentiment" in d.columns:
             sent_agg = _expand_categorical_counts(d, group_cols, ["sentiment"])
@@ -245,7 +279,6 @@ def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[
             if not text_df.empty:
                 results = results.merge(text_df, on=group_cols, how="left")
 
-    # workday_checkins: type, sentiment, summary concat
     if key == "workday_checkins":
         if "type" in d.columns:
             type_agg = _expand_categorical_counts(d, group_cols, ["type"])
@@ -263,7 +296,6 @@ def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[
             if not text_df.empty:
                 results = results.merge(text_df, on=group_cols, how="left")
 
-    # manager_evaluations: manager_comment + areas_of_focus concat
     if key == "manager_evaluations":
         if "manager_comment" in d.columns:
             text_df = d.groupby(group_cols)["manager_comment"].apply(lambda s: _concat_texts(s)).reset_index().rename(columns={"manager_comment": "manager_comment_concat"})
@@ -276,9 +308,7 @@ def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[
             if not txt2.empty:
                 results = results.merge(txt2, on=group_cols, how="left")
 
-    # Do not coerce text concat columns to numeric here; leave them as-is
     return results
-
 
 def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if not isinstance(loaded_raw, dict):
@@ -288,9 +318,9 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
     per_table_period: Dict[str, pd.DataFrame] = {}
     group_cols = ["employee_id", "period_half"]
 
+    # Build per-table period aggregates, but exclude idp_goals from period-level
     for key, df in loaded.items():
         try:
-            # defensive checks
             if df is None or not isinstance(df, pd.DataFrame) or df.empty:
                 per_table_period[key] = None
                 continue
@@ -306,69 +336,58 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
                 per_table_period[key] = txt_agg
                 continue
 
-            # IDP special handling: compute overdue flag if not present, and aggregate statuses
+            # skip adding idp_goals into period-level output (we will handle it in combined)
             if key == "idp_goals":
-                if "period_half" not in working.columns:
-                    working["period_half"] = "NA"
-                if "status" not in working.columns:
-                    working["status"] = ""
-                # compute overdue flag if missing
-                if "_idp_overdue_flag" not in working.columns:
-                    def _is_overdue_row(r):
-                        td_raw = r.get("target_date")
-                        st = str(r.get("status", "")).strip().lower()
-                        try:
-                            td = pd.to_datetime(td_raw, errors="coerce", infer_datetime_format=True)
-                        except Exception:
-                            td = pd.NaT
-                        if pd.isna(td):
-                            return 0
-                        if st == "completed":
-                            return 0
-                        return int(td.date() < datetime.date.today())
-                    working["_idp_overdue_flag"] = working.apply(_is_overdue_row, axis=1)
-                rows_agg = _base_row_counts(working, group_cols)
-                rows_agg = _merge_prefix(rows_agg, key, group_cols)
-                status_agg = _expand_categorical_counts(working, group_cols, ["status"])
-                status_agg = _merge_prefix(status_agg, key, group_cols) if not status_agg.empty else pd.DataFrame(columns=group_cols)
-                overdue_agg = working.groupby(group_cols)["_idp_overdue_flag"].sum().reset_index().rename(columns={"_idp_overdue_flag": f"{key}__overdue_count"})
-                merged = rows_agg
-                if not status_agg.empty:
-                    merged = merged.merge(status_agg, on=group_cols, how="left")
-                if not overdue_agg.empty:
-                    merged = merged.merge(overdue_agg, on=group_cols, how="left")
-                # numeric fill for numeric columns only
-                for c in merged.columns:
-                    if c in group_cols:
-                        continue
-                    try:
-                        merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
-                    except Exception:
-                        merged[c] = merged[c].fillna(0)
-                per_table_period[key] = merged
+                per_table_period[key] = None
                 continue
 
-            # generic numeric + categorical handling
+            # Generic numeric/categorical handling
             hints = NUMERIC_HINTS.get(key, [])
             numeric_candidates = _guess_numeric_cols(working, hints)
+
+            # ensure boolean-like columns are included (even if sparse)
+            for bool_like in ("escaped_to_prod", "on_time", "compliant"):
+                if bool_like in working.columns and bool_like not in numeric_candidates:
+                    numeric_candidates.append(bool_like)
+
             numeric_agg = _safe_numeric_sum_agg(working, group_cols, numeric_candidates)
             numeric_agg = _merge_prefix(numeric_agg, key, group_cols) if not numeric_agg.empty else pd.DataFrame(columns=group_cols)
             cat_agg = _expand_categorical_counts(working, group_cols, CATEGORICAL_EXPAND)
             cat_agg = _merge_prefix(cat_agg, key, group_cols) if not cat_agg.empty else pd.DataFrame(columns=group_cols)
             rows_agg = _base_row_counts(working, group_cols)
             rows_agg = _merge_prefix(rows_agg, key, group_cols)
+
             merged = rows_agg
             if not numeric_agg.empty:
                 merged = merged.merge(numeric_agg, on=group_cols, how="left")
             if not cat_agg.empty:
                 merged = merged.merge(cat_agg, on=group_cols, how="left")
+
+            # After merging, ensure boolean-like metrics are numeric ints (0/1)
+            for col in merged.columns:
+                if col in group_cols:
+                    continue
+                lname = col.lower()
+                if lname.endswith("__escaped_to_prod") or lname.endswith("__on_time") or lname.endswith("__compliant"):
+                    try:
+                        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(int)
+                    except Exception:
+                        merged[col] = merged[col].fillna(0)
+                else:
+                    # keep numeric or fill zeros for numeric-like columns
+                    try:
+                        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
+                    except Exception:
+                        # leave text-like columns as-is for now
+                        merged[col] = merged[col].fillna("")
+
             per_table_period[key] = merged
 
         except Exception as e:
             log.exception("Error processing table %s: %s", key, e)
             per_table_period[key] = None
 
-    # Build canonical keys - filter out missing/unknown employee_id and period_half == 'unknown'
+    # Build canonical keys (filter out missing/unknown employee_id and period_half == 'unknown')
     key_frames = []
     for k, agg_df in per_table_period.items():
         if agg_df is None or not isinstance(agg_df, pd.DataFrame) or agg_df.empty:
@@ -392,33 +411,30 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
 
     merged_all = keys_df.copy()
 
-    # Merge per-table aggregates, filtering out agg rows with missing/unknown employee_id
+    # Merge per-table aggregates (except idp_goals)
     for name, agg in per_table_period.items():
         if agg is None or not isinstance(agg, pd.DataFrame) or agg.empty:
             continue
         if not set(group_cols).issubset(set(agg.columns)):
             continue
+        # filter out missing employee_id rows
         agg2 = agg.copy()
         agg2 = agg2[agg2["employee_id"].notna()]
         agg2 = agg2[agg2["employee_id"].astype(str).str.strip() != ""]
         agg2 = agg2[agg2["employee_id"].astype(str).str.lower() != "unknown"]
         merged_all = merged_all.merge(agg2, on=group_cols, how="left")
 
-    # Preserve textual concat columns: detect them by name patterns
-    text_name_patterns = re.compile(r"(concat|comment|message|summary|areas_of_focus|comments_concat|manager_comment)", flags=re.IGNORECASE)
-
-    # Fill numeric columns with 0; keep text columns as strings
+    # Preserve textual concat columns and coerce numerics robustly
     for col in merged_all.columns:
         if col in group_cols:
             continue
-        is_text_by_name = bool(text_name_patterns.search(col))
-        if is_text_by_name:
+        if TEXT_NAME_PATTERNS.search(col):
             merged_all[col] = merged_all[col].fillna("").astype(str)
             continue
-        # else attempt numeric coercion and decide
+        # numeric coercion: if column name matches numeric hints or 50% of values numeric => numeric
         try:
             coerced = pd.to_numeric(merged_all[col], errors="coerce")
-            if coerced.notna().mean() >= 0.5:
+            if coerced.notna().mean() >= 0.2:
                 merged_all[col] = coerced.fillna(0)
             else:
                 merged_all[col] = merged_all[col].fillna("").astype(str)
@@ -427,27 +443,82 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
 
     features_by_period_df = merged_all
 
-    # Derived KPIs (kept but safe)
+    # Derived KPIs at period level
     features_by_period_df = _derive_safe_ratios(features_by_period_df)
 
-    # Build features_combined: aggregate numeric columns; keep text concats (merge)
+    # Build features_combined
     if not features_by_period_df.empty:
-        # numeric columns as those with numeric dtypes
+        # numeric columns: choose those with numeric dtype
         numeric_cols = [c for c in features_by_period_df.columns if c not in group_cols and pd.api.types.is_numeric_dtype(features_by_period_df[c])]
         features_combined_df = features_by_period_df.groupby("employee_id", dropna=False)[numeric_cols].sum().reset_index()
-
-        # text concat columns: aggregate by joining non-empty across periods
-        text_cols = [c for c in features_by_period_df.columns if isinstance(c, str) and text_name_patterns.search(c)]
-        for tc in text_cols:
-            combined_text = features_by_period_df.groupby("employee_id")[tc].apply(lambda s: _concat_texts(pd.Series([x for x in s if isinstance(x, str) and x.strip() != ""]))).reset_index().rename(columns={tc: tc})
-            features_combined_df = features_combined_df.merge(combined_text, on="employee_id", how="left")
-
-        # recompute derived ratios at combined level safely
-        features_combined_df = _derive_safe_ratios(features_combined_df)
     else:
         features_combined_df = pd.DataFrame(columns=["employee_id"])
 
-    # Merge employee metadata (role, org, name) into combined features if available
+    # IDP: compute combined-only idp_goals features (status counts, overdue)
+    idp_df = loaded.get("idp_goals")
+    if isinstance(idp_df, pd.DataFrame) and not idp_df.empty:
+        idp = idp_df.copy()
+        if "employee_id" not in idp.columns:
+            idp["employee_id"] = "unknown"
+        # ensure status column
+        if "status" not in idp.columns:
+            idp["status"] = ""
+        # compute overdue flag if not present
+        if "_idp_overdue_flag" not in idp.columns:
+            def _is_overdue_row(r):
+                td_raw = r.get("target_date")
+                st = str(r.get("status", "")).strip().lower()
+                try:
+                    td = pd.to_datetime(td_raw, errors="coerce", infer_datetime_format=True)
+                except Exception:
+                    td = pd.NaT
+                if pd.isna(td):
+                    return 0
+                if st == "completed":
+                    return 0
+                return int(td.date() < datetime.date.today())
+            idp["_idp_overdue_flag"] = idp.apply(_is_overdue_row, axis=1)
+        # group by employee_id (idp not tied to period)
+        idp_group_cols = ["employee_id"]
+        rows_agg = idp.groupby(idp_group_cols).size().reset_index().rename(columns={0: "idp_goals___rows"})
+        status_dummies = pd.get_dummies(idp["status"].astype(str).str.strip().fillna("unknown")).add_prefix("idp_goals__")
+        status_agg = pd.concat([idp[idp_group_cols].reset_index(drop=True), status_dummies.reset_index(drop=True)], axis=1).groupby(idp_group_cols).sum().reset_index()
+        overdue_agg = idp.groupby(idp_group_cols)["_idp_overdue_flag"].sum().reset_index().rename(columns={"_idp_overdue_flag": "idp_goals__overdue_count"})
+        # merge idp pieces into a single df
+        idp_combined = rows_agg.merge(status_agg, on="employee_id", how="left").merge(overdue_agg, on="employee_id", how="left")
+        # ensure numeric types
+        for c in idp_combined.columns:
+            if c == "employee_id":
+                continue
+            try:
+                idp_combined[c] = pd.to_numeric(idp_combined[c], errors="coerce").fillna(0)
+            except Exception:
+                idp_combined[c] = idp_combined[c].fillna("")
+        # merge into features_combined_df (left on employee_id)
+        if "employee_id" in features_combined_df.columns:
+            features_combined_df = features_combined_df.merge(idp_combined, on="employee_id", how="left")
+        else:
+            features_combined_df = features_combined_df.merge(idp_combined, on="employee_id", how="right")
+
+    # Bring text concat fields from period to combined (first non-empty across periods)
+    text_cols = [c for c in features_by_period_df.columns if isinstance(c, str) and TEXT_NAME_PATTERNS.search(c)]
+    for tc in text_cols:
+        combined_text = features_by_period_df.groupby("employee_id")[tc].apply(lambda s: _concat_texts(pd.Series([x for x in s if isinstance(x, str) and x.strip() != ""]))).reset_index().rename(columns={tc: tc})
+        features_combined_df = features_combined_df.merge(combined_text, on="employee_id", how="left")
+
+    # Ensure boolean-like aggregated columns are numeric 0/1 in combined too
+    for col in features_combined_df.columns:
+        lname = col.lower()
+        if lname.endswith("escaped_to_prod") or lname.endswith("on_time") or lname.endswith("compliant"):
+            try:
+                features_combined_df[col] = pd.to_numeric(features_combined_df[col], errors="coerce").fillna(0).astype(int)
+            except Exception:
+                features_combined_df[col] = features_combined_df[col].fillna(0)
+
+    # Recompute derived KPIs on combined (safe)
+    features_combined_df = _derive_safe_ratios(features_combined_df)
+
+    # Merge employee metadata (role, org, name)
     emp_df = loaded.get("employees")
     if isinstance(emp_df, pd.DataFrame) and "employee_id" in emp_df.columns:
         pick = ["employee_id"]
@@ -460,28 +531,23 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
         emp_meta = emp_df[pick].drop_duplicates(subset=["employee_id"])
         features_combined_df = features_combined_df.merge(emp_meta, on="employee_id", how="left")
 
-    log.info("compute_kpis_from_loaded: produced features_by_period rows=%s, features_combined rows=%s",
-             len(features_by_period_df), len(features_combined_df))
+    # Final logging
+    log.info(
+        "compute_kpis_from_loaded: produced features_by_period rows=%s, features_combined rows=%s",
+        len(features_by_period_df),
+        len(features_combined_df),
+    )
     return features_combined_df, features_by_period_df
 
-
 def compute_kpis(joined_or_loaded: Any) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Public wrapper — accepts:
-      - run_etl() result dict (extracts 'loaded' if present)
-      - loaded dict mapping table_name -> DataFrame
-      - flattened DataFrame (legacy)
-    """
-    # if run_etl() result dict passed (has top-level keys), extract loaded
+    # accept run_etl() result dict too
     if isinstance(joined_or_loaded, dict) and "loaded" in joined_or_loaded and not any(isinstance(v, pd.DataFrame) for v in joined_or_loaded.values()):
         loaded = joined_or_loaded.get("loaded")
         if loaded is None:
             return compute_kpis_from_loaded(joined_or_loaded)
         return compute_kpis_from_loaded(loaded)
-
     if isinstance(joined_or_loaded, dict):
         return compute_kpis_from_loaded(joined_or_loaded)
-
     if isinstance(joined_or_loaded, pd.DataFrame):
         df = joined_or_loaded.copy()
         if "employee_id" not in df.columns:
@@ -517,5 +583,4 @@ def compute_kpis(joined_or_loaded: Any) -> Tuple[pd.DataFrame, pd.DataFrame]:
         else:
             features_combined_df = pd.DataFrame(columns=["employee_id"])
         return features_combined_df, features_by_period_df
-
     raise ValueError("compute_kpis: unsupported input type. Expected loaded dict or DataFrame.")
