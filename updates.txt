@@ -1,24 +1,30 @@
-# defects: count and severity breakdown + escaped_to_prod sum
-df = loaded.get("defects")
-if df is not None:
-    numeric = []
-    if "escaped_to_prod" in df.columns:
-        numeric.append("escaped_to_prod")
-    per_table_period["defects"] = _safe_group_agg(
-        df, ["employee_id", "period_half"],
-        numeric_aggs=numeric,
-        object_aggs=None,
-        cat_expansions=["severity"] if "severity" in df.columns else None
-    )
+# after res = run_etl(...)
+res = run_etl(write_combined_json=True, json_compress=False, write_feature_csv=True)
 
-# jira_metrics
-df = loaded.get("jira_metrics")
-if df is not None:
-    numeric_cols = [c for c in ["story_points_committed","story_points_completed","spillover_points","bugs_introduced","bugs_fixed"] if c in df.columns]
-    per_table_period["jira"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=numeric_cols)
+# res is a dict with keys like: 'loaded', 'combined_json', 'features_combined_df', ...
+print("TOP-LEVEL RES KEYS:", list(res.keys()))
 
-# github_metrics
-df = loaded.get("github_metrics")
-if df is not None:
-    numeric_cols = [c for c in ["commits","pull_requests","reviews_done","copilot_suggestions_accepted","copilot_suggestions_total"] if c in df.columns]
-    per_table_period["github"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=numeric_cols)
+# The actual loaded tables live in res['loaded']
+loaded = res.get("loaded")
+if not isinstance(loaded, dict):
+    print("DEBUG: res['loaded'] is missing or not a dict:", type(loaded))
+else:
+    print("\nDEBUG: loaded keys and row counts:")
+    for k, df in loaded.items():
+        if df is None:
+            print(f"  {k:25} -> None")
+        else:
+            try:
+                print(f"  {k:25} -> rows: {len(df):6}  columns: {list(df.columns)}")
+            except Exception as e:
+                print(f"  {k:25} -> (error reading df) {e}")
+
+    # Also show a small sample of the employee_id values found across all tables:
+    ids = set()
+    for k, df in loaded.items():
+        if df is None:
+            continue
+        if "employee_id" in df.columns:
+            ids.update(df["employee_id"].astype(str).dropna().unique().tolist())
+    print("\nDEBUG: total unique employee_ids found across tables:", len(ids))
+    print("DEBUG: sample ids:", list(ids)[:10])
