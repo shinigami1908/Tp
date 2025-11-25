@@ -1,476 +1,88 @@
-# src/etl/etl_pipeline.py
-"""
-ETL pipeline entrypoint (JSON-first workflow, writes single combined JSON).
-
-Behavior:
-- Load all mockdata tables (via src.common.data_loader.load_all)
-- Attach period_half to each table (via src.etl.periodizer.attach_period_half)
-- Write a single combined JSON (OUTPUT_DIR / combined_employees.json)
-- Compute KPIs from loaded tables and write features JSONs/CSV as before
-"""
-from ..common.data_loader import load_all
-from .cleaner import normalize_manager_evaluations, normalize_employees
-from .periodizer import attach_period_half
-from ..common.config import OUTPUT_DIR
-from ..common.logger import get_logger
-
-# new combined JSON writer
-from .json_exporter import write_single_combined_json
-
-# KPI computation (unchanged)
-from ..features.feature_engineering import compute_kpis_from_loaded
-
-log = get_logger("etl_pipeline")
-
-
-def run_etl(write_combined_json: bool = True, json_compress: bool = False,
-            write_feature_csv: bool = True):
-    """
-    Run ETL:
-      - loads all tables into `loaded` dict
-      - attaches period_half
-      - writes single combined JSON (all employees) if write_combined_json True
-      - computes KPIs (per-employee and per-employee-per-period)
-    """
-    loaded = load_all()
-
-    # normalization kept for compatibility (no-ops for clean mock data)
-    try:
-        loaded['manager_evaluations'] = normalize_manager_evaluations(loaded.get('manager_evaluations'))
-    except Exception:
-        log.info("normalize_manager_evaluations not available or failed - proceeding with raw data")
-    try:
-        loaded['employees'] = normalize_employees(loaded.get('employees'))
-    except Exception:
-        log.info("normalize_employees not available or failed - proceeding with raw data")
-
-    # Attach period_half
-    for key in list(loaded.keys()):
-        df = loaded.get(key)
-        if df is None:
-            continue
-        try:
-            loaded[key] = attach_period_half(df, key_hint=key)
-            log.info(f"Attached period_half to {key}")
-        except Exception as e:
-            log.warning(f"Could not attach period_half for {key}: {e}")
-
-    # Write single combined JSON (streamed)
-    combined_json_res = None
-    if write_combined_json:
-        try:
-            combined_json_res = write_single_combined_json(loaded,
-                                                           out_path=OUTPUT_DIR / "combined_employees.json",
-                                                           include_raw=True,
-                                                           compress=json_compress)
-            log.info("Wrote combined JSON: %s", combined_json_res.get("path"))
-        except Exception as e:
-            log.warning("Failed to write combined JSON: %s", e)
-
-    # Compute KPIs from loaded (unchanged behavior)
-    try:
-        features_combined_df, features_by_period_df = compute_kpis_from_loaded(loaded)
-        # write feature JSONs and optional CSVs
-        fc_json_path = OUTPUT_DIR / "features_combined.json"
-        fb_json_path = OUTPUT_DIR / "features_by_period.json"
-        features_combined_df.to_json(fc_json_path, orient="records", force_ascii=False, indent=2)
-        features_by_period_df.to_json(fb_json_path, orient="records", force_ascii=False, indent=2)
-        log.info(f"Wrote features JSONs: {fc_json_path}, {fb_json_path}")
-        if write_feature_csv:
-            try:
-                features_combined_df.to_csv(OUTPUT_DIR / "features_combined.csv", index=False)
-                features_by_period_df.to_csv(OUTPUT_DIR / "features_by_period.csv", index=False)
-                log.info("Also wrote features CSVs for convenience")
-            except Exception as e:
-                log.warning(f"Failed to write features CSVs: {e}")
-    except Exception as e:
-        log.error(f"Feature computation failed: {e}")
-        features_combined_df = None
-        features_by_period_df = None
-
-    return {
-        "loaded": loaded,
-        "combined_json": combined_json_res,
-        "features_combined_df": features_combined_df,
-        "features_by_period_df": features_by_period_df,
-    }
-
-# src/features/feature_engineering.py
-"""
-Feature engineering / KPI computation.
-
-This module computes per-employee and per-employee+period KPIs using the
-in-memory `loaded` dict (dataframes read from CSVs by data_loader.load_all).
-
-Design:
-- For each table, aggregate numeric columns (sum) per employee and per (employee, period_half)
-- For non-numeric columns we compute counts / first_value as small indicators
-- Combine aggregated outputs into features_by_period (one row per employee+period)
-- Derive features_combined by grouping features_by_period across periods (sum/mean or picking latest)
-"""
-
-import pandas as pd
-from typing import Dict, Tuple
-from ..common.logger import get_logger
-
-log = get_logger("feature_engineering")
-
-
-def _safe_group_agg(df: pd.DataFrame, group_cols, numeric_aggs=None, object_aggs=None):
-    """
-    Generic helper:
-      - numeric_aggs: list of numeric columns to sum
-      - object_aggs: list of object columns to count non-null (or first value)
-    Returns aggregated DataFrame (grouped).
-    """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=group_cols)
-
-    # Ensure period_half present as str if exists
-    if 'period_half' in df.columns:
-        df['period_half'] = df['period_half'].astype(str)
-
-    g = df.groupby(group_cols, dropna=False)
-    agg_ops = {}
-    if numeric_aggs:
-        for c in numeric_aggs:
-            if c in df.columns:
-                agg_ops[c] = 'sum'
-    if object_aggs:
-        for c in object_aggs:
-            if c in df.columns:
-                # count non-null occurrences
-                agg_ops[c] = lambda s: s.notna().sum()
-
-    # always include a simple row count
-    agg_ops['_rows'] = ('employee_id', 'count')
-
-    if not agg_ops:
-        # fallback: only count rows
-        return g.size().reset_index().rename(columns={0: '_rows'})
-
-    try:
-        out = g.agg(agg_ops).reset_index()
-    except Exception:
-        # fallback conservative
-        out = g.size().reset_index().rename(columns={0: '_rows'})
-    return out
-
-
-def compute_kpis_from_loaded(loaded: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Compute KPIs using loaded dict.
-    Returns (features_combined_df, features_by_period_df)
-    """
-
-    # We'll compute per-table summaries keyed by (employee_id, period_half) where possible.
-    per_table_period = {}
-
-    # 1) defects -> count by severity; escaped_to_prod count
-    df = loaded.get('defects')
-    if df is not None:
-        # ensure boolean column parsed already in data_loader
-        numeric = []
-        obj_cols = []
-        if 'severity' in df.columns:
-            # count rows per severity is more complex; for now count total defects
-            obj_cols.append('severity')
-        if 'escaped_to_prod' in df.columns:
-            # escaped_to_prod is boolean; sum of True values is count escaped
-            numeric.append('escaped_to_prod')
-        per_table_period['defects'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=numeric, object_aggs=obj_cols)
-
-    # 2) jira_metrics -> story points committed/completed, bugs introduced/fixed, spillover
-    df = loaded.get('jira_metrics')
-    if df is not None:
-        numeric = [c for c in ['story_points_committed', 'story_points_completed', 'spillover_points', 'bugs_introduced', 'bugs_fixed'] if c in df.columns]
-        per_table_period['jira'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=numeric, object_aggs=None)
-
-    # 3) github_metrics -> commits, pull_requests, reviews_done, copilot suggestions accepted/total
-    df = loaded.get('github_metrics')
-    if df is not None:
-        numeric = [c for c in ['commits', 'pull_requests', 'reviews_done', 'copilot_suggestions_accepted', 'copilot_suggestions_total'] if c in df.columns]
-        per_table_period['github'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=numeric, object_aggs=None)
-
-    # 4) feedback_360 -> count of feedbacks and sentiment counts (if present)
-    df = loaded.get('feedback_360')
-    if df is not None:
-        numeric = []
-        obj_cols = ['sentiment'] if 'sentiment' in df.columns else None
-        per_table_period['feedback'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=numeric, object_aggs=obj_cols)
-
-    # 5) rto -> required_days, in_office_days, compliant counts
-    df = loaded.get('rto')
-    if df is not None:
-        numeric = [c for c in ['required_days', 'in_office_days'] if c in df.columns]
-        # compliant is boolean -> sum counts
-        if 'compliant' in df.columns:
-            numeric.append('compliant')
-        per_table_period['rto'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=numeric, object_aggs=None)
-
-    # 6) lms_completions -> hours, score counts
-    df = loaded.get('lms_completions')
-    if df is not None:
-        numeric = [c for c in ['hours', 'score'] if c in df.columns]
-        per_table_period['lms'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=numeric, object_aggs=None)
-
-    # 7) recognition -> count recognition occurrences
-    df = loaded.get('recognition')
-    if df is not None:
-        per_table_period['recognition'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=None, object_aggs=['type'])
-
-    # 8) idp_goals -> count goals and completed
-    df = loaded.get('idp_goals')
-    if df is not None:
-        obj_cols = ['status'] if 'status' in df.columns else None
-        per_table_period['idp'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=None, object_aggs=obj_cols)
-
-    # 9) manager_evaluations -> rating presence and counts
-    df = loaded.get('manager_evaluations')
-    if df is not None:
-        # rating presence count and bias_type count
-        numeric = []
-        obj_cols = []
-        if 'rating' in df.columns:
-            obj_cols.append('rating')
-        if 'bias_type' in df.columns:
-            obj_cols.append('bias_type')
-        per_table_period['mgr_eval'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=numeric, object_aggs=obj_cols)
-
-    # 10) workday_checkins -> count and sentiment
-    df = loaded.get('workday_checkins')
-    if df is not None:
-        obj_cols = ['sentiment'] if 'sentiment' in df.columns else None
-        per_table_period['checkins'] = _safe_group_agg(df, ['employee_id', 'period_half'], numeric_aggs=None, object_aggs=obj_cols)
-
-    # Merge all per_table_period into a single features_by_period DataFrame
-    # Start with a canonical key set: union of all (employee_id, period_half)
-    all_keys = []
-    for name, df in per_table_period.items():
-        if df is None or df.empty:
-            continue
-        all_keys.append(df[['employee_id', 'period_half']].drop_duplicates())
-    if all_keys:
-        keys_df = pd.concat(all_keys).drop_duplicates().reset_index(drop=True)
-    else:
-        # fallback: try employees table
-        emp_df = loaded.get('employees')
-        if emp_df is not None and 'employee_id' in emp_df.columns:
-            keys_df = emp_df[['employee_id']].drop_duplicates().assign(period_half='unknown')
-        else:
-            keys_df = pd.DataFrame(columns=['employee_id', 'period_half'])
-
-    # initialize merged df
-    merged = keys_df.copy()
-
-    # sequentially left-merge each per-table aggregation (safe: small tables)
-    for name, df in per_table_period.items():
-        if df is None or df.empty:
-            continue
-        # rename columns to include prefix
-        pref = f"{name}_"
-        df_renamed = df.copy()
-        for c in df_renamed.columns:
-            if c not in ('employee_id', 'period_half'):
-                df_renamed = df_renamed.rename(columns={c: pref + c})
-        merged = merged.merge(df_renamed, on=['employee_id', 'period_half'], how='left')
-
-    # Fill NAs with 0 for numeric-like columns; leave others as-is
-    for col in merged.columns:
-        if col in ('employee_id', 'period_half'):
-            continue
-        # attempt numeric fill
-        try:
-            merged[col] = pd.to_numeric(merged[col], errors='coerce').fillna(0)
-        except Exception:
-            # leave non-numeric fields as-is (they are counts but maybe stored as object)
-            merged[col] = merged[col].fillna(0)
-
-    # features_by_period is merged
-    features_by_period_df = merged
-
-    # Now compute features_combined_df (one-row-per-employee) by aggregating across periods
-    if not features_by_period_df.empty:
-        # drop period_half and sum numeric columns per employee
-        numeric_cols = [c for c in features_by_period_df.columns if c not in ('employee_id', 'period_half')]
-        combined = features_by_period_df.groupby('employee_id', dropna=False)[numeric_cols].sum().reset_index()
-    else:
-        combined = pd.DataFrame(columns=['employee_id'])
-
-    features_combined_df = combined
-
-    log.info("Computed KPIs: features_by_period rows=%s, features_combined rows=%s",
-             len(features_by_period_df), len(features_combined_df))
-
-    return features_combined_df, features_by_period_df
-
-# src/etl/json_exporter.py
-"""
-Write a single combined JSON file containing all employees.
-
-Outputs:
- - OUTPUT_DIR / combined_employees.json  (or .json.gz if compress=True)
-
-Format:
-{
-  "employees": [
-    { "employee_id": "...", "periods": { "2025H1": { "summary": {...}, "raw": {...} }, ... } },
-    ...
-  ]
-}
-
-The writer streams employee objects to disk to avoid building a giant in-memory list.
-"""
-
-import json
-from pathlib import Path
-from typing import Dict, Any, Iterable
-import pandas as pd
-from ..common.config import OUTPUT_DIR
-from ..common.logger import get_logger
-
-log = get_logger("json_exporter")
-
+# --- REPLACE/UPDATE this helper in src/etl/json_exporter.py ---
 
 def _row_to_simple(obj):
-    """Convert pandas.Timestamp and numpy scalar types to JSON-serializable."""
-    if obj is None:
-        return None
+    """
+    Convert objects not JSON-serializable (pandas.Timestamp, pandas.NaT, numpy scalars, NaN)
+    into simple Python types.
+    """
+    # handle pandas NaT / numpy NaN early
     try:
         import pandas as _pd
-        if isinstance(obj, _pd.Timestamp):
+        import numpy as _np
+    except Exception:
+        _pd = None
+        _np = None
+
+    # pandas NaT or numpy NaN -> None
+    try:
+        if _pd is not None and (_pd.isna(obj) or obj is _pd.NaT):
+            return None
+    except Exception:
+        # pd.isna may fail for some exotic types - ignore
+        pass
+
+    # pandas Timestamp -> ISO string
+    try:
+        if _pd is not None and isinstance(obj, _pd.Timestamp):
+            if pd.isna(obj):
+                return None
             return obj.isoformat()
     except Exception:
         pass
+
+    # pandas Timedelta -> string
     try:
-        import numpy as _np
-        if isinstance(obj, (_np.generic,)):
+        if _pd is not None and isinstance(obj, _pd.Timedelta):
+            return str(obj)
+    except Exception:
+        pass
+
+    # numpy scalar types -> Python scalars
+    try:
+        if _np is not None and isinstance(obj, (_np.generic,)):
             return obj.item()
     except Exception:
         pass
+
+    # builtin floats that are nan
+    try:
+        import math
+        if isinstance(obj, float) and math.isnan(obj):
+            return None
+    except Exception:
+        pass
+
+    # fallback: return as-is (serializer fallback will handle remaining)
     return obj
 
 
-def _safe_record_from_series(s: pd.Series) -> Dict[str, Any]:
-    out = {}
-    for k, v in s.items():
-        out[k] = _row_to_simple(v)
-    return out
 
 
-def _iter_employee_objects(loaded: Dict[str, pd.DataFrame], include_raw: bool = True) -> Iterable[Dict[str, Any]]:
-    """
-    Generator that yields employee objects one by one.
-    """
-    # prefer employees table for ID list
-    emp_df = loaded.get("employees")
-    if emp_df is not None and "employee_id" in emp_df.columns:
-        employee_ids = emp_df["employee_id"].astype(str).dropna().unique().tolist()
-    else:
-        ids = set()
-        for k, df in loaded.items():
-            if df is None or "employee_id" not in df.columns:
-                continue
-            ids.update(df["employee_id"].astype(str).dropna().unique().tolist())
-        employee_ids = sorted(list(ids))
 
-    mapping = {
-        "manager_evaluations": "manager_evals",
-        "jira_metrics": "jira_metrics",
-        "defects": "defects",
-        "feedback_360": "feedback",
-        "github_metrics": "github_metrics",
-        "release_metrics": "release_metrics",
-        "rto": "rto",
-        "workday_checkins": "workday_checkins",
-        "recognition": "recognition",
-        "idp_goals": "idp_goals",
-        "lms_completions": "lms_completions"
-    }
+# inside write_single_combined_json(...), where you iterate emp_obj
 
-    for eid in employee_ids:
-        emp_obj: Dict[str, Any] = {"employee_id": str(eid), "periods": {}}
-        per_period: Dict[str, Dict[str, Any]] = {}
+# Example for uncompressed file (same logic applies to gzip branch)
+with open(target, "w", encoding="utf-8") as fh:
+    fh.write('{"employees": [')
+    first = True
+    for emp_obj in _iter_employee_objects(loaded, include_raw=include_raw):
+        # ensure nested values are converted using _row_to_simple already when building emp_obj,
+        # but we still guard here against unexpected types
+        try:
+            s = json.dumps(emp_obj, ensure_ascii=False)
+        except Exception:
+            # log and try a tolerant serialization
+            try:
+                s = json.dumps(emp_obj, default=str, ensure_ascii=False)
+                log.warning("json_exporter: fallback-serialized employee_id=%s using default=str", emp_obj.get("employee_id"))
+            except Exception as e2:
+                # ultimate fallback: write minimal safe object and log exception
+                log.exception("json_exporter: failed to serialize employee_id=%s; writing placeholder. Error: %s", emp_obj.get("employee_id"), e2)
+                s = json.dumps({"employee_id": emp_obj.get("employee_id"), "serialization_error": True}, ensure_ascii=False)
 
-        for key, short in mapping.items():
-            df = loaded.get(key)
-            if df is None or df.empty:
-                continue
-            if "employee_id" not in df.columns:
-                continue
-            sel = df[df["employee_id"].astype(str) == str(eid)]
-            if sel.empty:
-                continue
-
-            if "period_half" in sel.columns:
-                for _, row in sel.iterrows():
-                    period = row.get("period_half", "unknown")
-                    if pd.isna(period):
-                        period = "unknown"
-                    period = str(period)
-                    per_period.setdefault(period, {})
-                    per_period[period].setdefault(short, [])
-                    per_period[period][short].append(_safe_record_from_series(row))
-            else:
-                per_period.setdefault("unknown", {})
-                per_period["unknown"].setdefault(short, [])
-                for _, row in sel.iterrows():
-                    per_period["unknown"][short].append(_safe_record_from_series(row))
-
-        for period, tables in per_period.items():
-            emp_obj["periods"].setdefault(period, {})
-            summary = {f"{k}_count": len(v) for k, v in tables.items()}
-            emp_obj["periods"][period]["summary"] = summary
-            if include_raw:
-                emp_obj["periods"][period]["raw"] = tables
-
-        yield emp_obj
-
-
-def write_single_combined_json(loaded: Dict[str, pd.DataFrame],
-                               out_path: str | Path = None,
-                               include_raw: bool = True,
-                               compress: bool = False) -> Dict[str, str]:
-    """
-    Write a single combined JSON file with all employees.
-
-    Parameters:
-      - loaded: dict of dataframes (as returned by load_all())
-      - out_path: optional path (defaults to OUTPUT_DIR / "combined_employees.json")
-      - include_raw: include raw arrays inside each employee (default True)
-      - compress: if True write gzipped JSON (out_path + ".gz")
-    Returns:
-      dict with 'path' pointing to written file
-    """
-    out_dir = Path(out_path).parent if out_path else Path(OUTPUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    default_path = Path(OUTPUT_DIR) / "combined_employees.json"
-    target = Path(out_path) if out_path else default_path
-
-    if compress:
-        import gzip
-        gz_target = str(target) + ".gz"
-        log.info("Writing compressed combined JSON to %s", gz_target)
-        with gzip.open(gz_target, "wt", encoding="utf-8") as fh:
-            fh.write('{"employees": [')
-            first = True
-            for emp_obj in _iter_employee_objects(loaded, include_raw=include_raw):
-                if not first:
-                    fh.write(",\n")
-                fh.write(json.dumps(emp_obj, ensure_ascii=False))
-                first = False
-            fh.write("]}")
-        return {"path": str(Path(gz_target).resolve())}
-    else:
-        log.info("Writing combined JSON to %s", str(target))
-        with open(target, "w", encoding="utf-8") as fh:
-            fh.write('{"employees": [')
-            first = True
-            for emp_obj in _iter_employee_objects(loaded, include_raw=include_raw):
-                if not first:
-                    fh.write(",\n")
-                fh.write(json.dumps(emp_obj, ensure_ascii=False))
-                first = False
-            fh.write("]}")
-        return {"path": str(Path(target).resolve())}
+        if not first:
+            fh.write(",\n")
+        fh.write(s)
+        fh.flush()          # make progress visible on disk immediately
+        first = False
+    fh.write("]}")
