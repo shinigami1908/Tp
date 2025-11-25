@@ -1,88 +1,170 @@
-# --- REPLACE/UPDATE this helper in src/etl/json_exporter.py ---
+# src/etl/periodizer.py
+import re
+from pathlib import Path
+from typing import Optional
+import pandas as pd
+from ..common.logger import get_logger
 
-def _row_to_simple(obj):
-    """
-    Convert objects not JSON-serializable (pandas.Timestamp, pandas.NaT, numpy scalars, NaN)
-    into simple Python types.
-    """
-    # handle pandas NaT / numpy NaN early
-    try:
-        import pandas as _pd
-        import numpy as _np
-    except Exception:
-        _pd = None
-        _np = None
+log = get_logger("periodizer")
 
-    # pandas NaT or numpy NaN -> None
+# Default year to assume when only H1/H2 are present
+DEFAULT_YEAR = 2025
+
+_sprint_re = re.compile(r"(?P<period>\d{4}H[12])", flags=re.IGNORECASE)
+_yearhalf_re = re.compile(r"(?P<year>\d{4})\s*[ -_]?H(?P<half>[12])", flags=re.IGNORECASE)
+
+
+def _normalize_h1h2(value: str) -> Optional[str]:
+    """Normalize values like 'H1' -> '2025H1' (DEFAULT_YEAR) and preserve '2025H1'."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v:
+        return None
+    # direct 2025H1 or 2024H2 etc.
+    m = _yearhalf_re.search(v)
+    if m:
+        year = m.group("year")
+        half = m.group("half")
+        return f"{year}H{half}"
+    # simple H1 / H2 (no year) -> assume DEFAULT_YEAR
+    if v.upper() in ("H1", "H2"):
+        return f"{DEFAULT_YEAR}{v.upper()}"
+    # if already looks like 2025H1 (no dash), accept it
+    m2 = re.match(r"^\d{4}H[12]$", v, flags=re.IGNORECASE)
+    if m2:
+        return v.upper()
+    return None
+
+
+def _infer_from_sprint(s: str) -> Optional[str]:
+    """If sprint contains '2025H1-S3' extract '2025H1'."""
+    if s is None:
+        return None
+    s = str(s)
+    m = _sprint_re.search(s)
+    if m:
+        return m.group("period").upper()
+    # fallback: if sprint contains H1/H2 tokens without year
+    if "H1" in s.upper():
+        return f"{DEFAULT_YEAR}H1"
+    if "H2" in s.upper():
+        return f"{DEFAULT_YEAR}H2"
+    return None
+
+
+def _infer_from_date_value(val) -> Optional[str]:
+    """Given a single date-like value, return period_half like '2025H1' or None."""
+    if val is None:
+        return None
     try:
-        if _pd is not None and (_pd.isna(obj) or obj is _pd.NaT):
+        ts = pd.to_datetime(val, errors="coerce")
+        if pd.isna(ts):
             return None
+        year = ts.year
+        month = ts.month
+        half = "H1" if month <= 6 else "H2"
+        return f"{year}{half}"
     except Exception:
-        # pd.isna may fail for some exotic types - ignore
-        pass
+        return None
 
-    # pandas Timestamp -> ISO string
+
+def attach_period_half(df: pd.DataFrame, key_hint: Optional[str] = None) -> pd.DataFrame:
+    """
+    Attach/normalize a `period_half` column to the dataframe.
+
+    Rules implemented:
+    - If df already has 'period_half', normalize values (H1/H2 -> 2025H1/2025H2, keep YYYYH1)
+    - If df has 'period' column with H1/H2 values, normalize similarly
+    - If df has 'sprint' column like '2025H1-S3', extract the YYYYH1
+    - If a row ends up with 'unknown', attempt to infer from date-like columns:
+      'date', 'completion_date', 'month', 'created_at', 'timestamp' (in that order)
+      - month in 'YYYY-MM' will be parsed as the first day of that month
+    - If still cannot infer, set 'period_half' = 'unknown'
+    """
+    if df is None:
+        return df
+
+    df = df.copy()
+    # ensure period_half column exists
+    if "period_half" not in df.columns:
+        df["period_half"] = None
+
+    # 1) normalize existing 'period_half' and 'period' columns
+    # normalize function will handle H1/H2 or YYYYH1 etc.
+    if "period_half" in df.columns:
+        df["period_half"] = df["period_half"].apply(lambda v: _normalize_h1h2(v) or (str(v).strip() if pd.notna(v) and str(v).strip() else None))
+
+    if "period" in df.columns:
+        # only fill where period_half is missing
+        mask = df["period_half"].isna() | (df["period_half"] == "")
+        if mask.any():
+            df.loc[mask, "period_half"] = df.loc[mask, "period"].apply(lambda v: _normalize_h1h2(v) or None)
+
+    # 2) use sprint column if present (common for jira_metrics)
+    if "sprint" in df.columns:
+        mask = df["period_half"].isna() | (df["period_half"] == "")
+        if mask.any():
+            df.loc[mask, "period_half"] = df.loc[mask, "sprint"].apply(lambda v: _infer_from_sprint(v) or None)
+
+    # 3) For specific keys where values may be H1/H2 (manager_evaluations, workday_checkins),
+    #    we want to map raw 'H1'/'H2' as well (already handled by _normalize_h1h2 if present in period)
+    #    So nothing extra needed here.
+
+    # 4) For tables where 'month' is in YYYY-MM, parse it
+    if "month" in df.columns:
+        mask = df["period_half"].isna() | (df["period_half"] == "")
+        if mask.any():
+            def from_month_val(v):
+                try:
+                    if pd.isna(v):
+                        return None
+                    s = str(v).strip()
+                    # if it's already YYYY-MM or YYYY-M
+                    if re.match(r"^\d{4}-\d{1,2}$", s):
+                        return _infer_from_date_value(s + "-01")
+                    # if it's a proper datetime-like string
+                    return _infer_from_date_value(s)
+                except Exception:
+                    return None
+            df.loc[mask, "period_half"] = df.loc[mask, "month"].apply(from_month_val)
+
+    # 5) For rows still unknown, try to infer from date columns
+    date_columns_priority = ["date", "completion_date", "created_at", "timestamp", "manager_timestamp"]
+    for col in date_columns_priority:
+        if col in df.columns:
+            mask = df["period_half"].isna() | (df["period_half"] == "")
+            if not mask.any():
+                break
+            df.loc[mask, "period_half"] = df.loc[mask, col].apply(lambda v: _infer_from_date_value(v))
+
+    # Replace any remaining empty strings / NaN with explicit "unknown"
+    df["period_half"] = df["period_half"].fillna("").astype(str).str.strip()
+    df.loc[df["period_half"] == "", "period_half"] = "unknown"
+
+    # final normalization: enforce uppercase like '2025H1'
+    def _final_norm(val):
+        if val is None:
+            return "unknown"
+        v = str(val).strip()
+        if v.lower() == "unknown" or v == "":
+            return "unknown"
+        # if looks like H1/H2 only
+        if re.match(r"^H[12]$", v, flags=re.IGNORECASE):
+            return f"{DEFAULT_YEAR}{v.upper()}"
+        # match 4-digit year + H1/H2
+        if re.match(r"^\d{4}H[12]$", v, flags=re.IGNORECASE):
+            return v.upper()
+        # fallback: unknown
+        return "unknown"
+
+    df["period_half"] = df["period_half"].apply(_final_norm)
+
+    # log summary stats
     try:
-        if _pd is not None and isinstance(obj, _pd.Timestamp):
-            if pd.isna(obj):
-                return None
-            return obj.isoformat()
+        counts = df["period_half"].value_counts(dropna=False).to_dict()
+        log.info("attach_period_half(%s) produced period counts: %s", key_hint or "", counts)
     except Exception:
         pass
 
-    # pandas Timedelta -> string
-    try:
-        if _pd is not None and isinstance(obj, _pd.Timedelta):
-            return str(obj)
-    except Exception:
-        pass
-
-    # numpy scalar types -> Python scalars
-    try:
-        if _np is not None and isinstance(obj, (_np.generic,)):
-            return obj.item()
-    except Exception:
-        pass
-
-    # builtin floats that are nan
-    try:
-        import math
-        if isinstance(obj, float) and math.isnan(obj):
-            return None
-    except Exception:
-        pass
-
-    # fallback: return as-is (serializer fallback will handle remaining)
-    return obj
-
-
-
-
-
-# inside write_single_combined_json(...), where you iterate emp_obj
-
-# Example for uncompressed file (same logic applies to gzip branch)
-with open(target, "w", encoding="utf-8") as fh:
-    fh.write('{"employees": [')
-    first = True
-    for emp_obj in _iter_employee_objects(loaded, include_raw=include_raw):
-        # ensure nested values are converted using _row_to_simple already when building emp_obj,
-        # but we still guard here against unexpected types
-        try:
-            s = json.dumps(emp_obj, ensure_ascii=False)
-        except Exception:
-            # log and try a tolerant serialization
-            try:
-                s = json.dumps(emp_obj, default=str, ensure_ascii=False)
-                log.warning("json_exporter: fallback-serialized employee_id=%s using default=str", emp_obj.get("employee_id"))
-            except Exception as e2:
-                # ultimate fallback: write minimal safe object and log exception
-                log.exception("json_exporter: failed to serialize employee_id=%s; writing placeholder. Error: %s", emp_obj.get("employee_id"), e2)
-                s = json.dumps({"employee_id": emp_obj.get("employee_id"), "serialization_error": True}, ensure_ascii=False)
-
-        if not first:
-            fh.write(",\n")
-        fh.write(s)
-        fh.flush()          # make progress visible on disk immediately
-        first = False
-    fh.write("]}")
+    return df
