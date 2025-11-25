@@ -1,9 +1,135 @@
-# --- Ensure all "*__rows" columns are numeric ints (fixes release_metrics__rows being empty string) ---
-rows_cols = [c for c in merged_all.columns if c.endswith("__rows")]
-for rc in rows_cols:
-    try:
-        merged_all[rc] = pd.to_numeric(merged_all[rc], errors="coerce").fillna(0).astype(int)
-    except Exception:
-        # final fallback: convert to int by manual fill
-        merged_all[rc] = merged_all[rc].apply(lambda x: int(float(x)) if (pd.notna(x) and str(x).strip()!='') else 0)
-# --- end rows normalization ---
+def _derive_safe_ratios(merged: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute KPIs (safe division, zero-guard) and prefix them with kpi__.
+    Adds:
+      - kpi__velocity                      -> jira_metrics__story_points_completed (sum)
+      - kpi__spillover_pct                 -> 100 * spillover_points / story_points_committed
+      - kpi__defect_density_per_100_sp     -> 100 * defects___rows / story_points_completed
+      - kpi__360_sentiment_positive_pct    -> 100 * feedback_360__sentiment_positive / feedback_360___rows
+      - kpi__360_sentiment_constructive_pct-> 100 * feedback_360__sentiment_constructive / feedback_360___rows
+      - (optionally) kpi__360_sentiment_mixed_pct if mixed present
+    Keeps earlier KPIs (kpi__story_point_completion_ratio, kpi__defect_escape_rate,
+    kpi__rto_compliance_rate, kpi__copilot_accept_ratio).
+    """
+    df = merged.copy()
+
+    def safe_div(a, b, scale=1.0):
+        try:
+            a = float(a) if a not in (None, "", "nan", np.nan) else 0.0
+            b = float(b) if b not in (None, "", "nan", np.nan, 0) else 0.0
+            if b == 0:
+                return 0.0
+            return (a / b) * scale
+        except Exception:
+            return 0.0
+
+    # velocity = story points completed (period-level; combined will sum)
+    df["kpi__velocity"] = df.get("jira_metrics__story_points_completed", 0).fillna(0).astype(float)
+
+    # spillover percent: 100 * spillover_points / committed_points
+    df["kpi__spillover_pct"] = df.apply(
+        lambda r: safe_div(r.get("jira_metrics__spillover_points", 0), r.get("jira_metrics__story_points_committed", 0), scale=100.0),
+        axis=1,
+    )
+
+    # defect density per 100 story points: 100 * defects___rows / story_points_completed
+    df["kpi__defect_density_per_100_sp"] = df.apply(
+        lambda r: safe_div(r.get("defects___rows", 0), r.get("jira_metrics__story_points_completed", 0), scale=100.0),
+        axis=1,
+    )
+
+    # 360 sentiment percentages (safe)
+    fb_rows_col = "feedback_360___rows"
+    if fb_rows_col in df.columns:
+        # positive
+        pos_col = "feedback_360__sentiment_positive"
+        cons_col = "feedback_360__sentiment_constructive"
+        mix_col = "feedback_360__sentiment_mixed"
+        df["kpi__360_sentiment_positive_pct"] = df.apply(
+            lambda r: safe_div(r.get(pos_col, 0), r.get(fb_rows_col, 0), scale=100.0), axis=1
+        )
+        df["kpi__360_sentiment_constructive_pct"] = df.apply(
+            lambda r: safe_div(r.get(cons_col, 0), r.get(fb_rows_col, 0), scale=100.0), axis=1
+        )
+        if mix_col in df.columns:
+            df["kpi__360_sentiment_mixed_pct"] = df.apply(
+                lambda r: safe_div(r.get(mix_col, 0), r.get(fb_rows_col, 0), scale=100.0), axis=1
+            )
+        else:
+            # ensure column exists (0) so ordering/combined aggregation stays stable
+            df["kpi__360_sentiment_mixed_pct"] = 0.0
+    else:
+        # fallback: no feedback_360 rows present: produce zeroed columns
+        df["kpi__360_sentiment_positive_pct"] = 0.0
+        df["kpi__360_sentiment_constructive_pct"] = 0.0
+        df["kpi__360_sentiment_mixed_pct"] = 0.0
+
+    # existing KPIs (keep them; recompute / ensure naming kpi__)
+    # story point completion ratio
+    if "jira_metrics__story_points_completed" in df.columns and "jira_metrics__story_points_committed" in df.columns:
+        df["kpi__story_point_completion_ratio"] = df.apply(
+            lambda r: safe_div(r.get("jira_metrics__story_points_completed", 0), r.get("jira_metrics__story_points_committed", 0)),
+            axis=1,
+        )
+    else:
+        df["kpi__story_point_completion_ratio"] = 0.0
+
+    # defect escape rate
+    df["kpi__defect_escape_rate"] = df.apply(
+        lambda r: safe_div(r.get("defects__escaped_to_prod", 0), r.get("defects___rows", 0)),
+        axis=1,
+    )
+
+    # rto compliance rate
+    df["kpi__rto_compliance_rate"] = df.apply(
+        lambda r: safe_div(r.get("rto__in_office_days", 0), r.get("rto__required_days", 0), scale=100.0),
+        axis=1,
+    )
+    df["kpi__rto_compliance_rate"] = df["kpi__rto_compliance_rate"].clip(upper=100.0)
+
+    # copilot accept ratio
+    df["kpi__copilot_accept_ratio"] = df.apply(
+        lambda r: safe_div(
+            r.get("github_metrics__copilot_suggestions_accepted", 0),
+            r.get("github_metrics__copilot_suggestions_total", 0),
+        ),
+        axis=1,
+    )
+
+    # ensure numeric columns are floats (for JSON serialization + combined aggregation)
+    for c in [
+        "kpi__velocity",
+        "kpi__spillover_pct",
+        "kpi__defect_density_per_100_sp",
+        "kpi__360_sentiment_positive_pct",
+        "kpi__360_sentiment_constructive_pct",
+        "kpi__360_sentiment_mixed_pct",
+        "kpi__story_point_completion_ratio",
+        "kpi__defect_escape_rate",
+        "kpi__rto_compliance_rate",
+        "kpi__copilot_accept_ratio",
+    ]:
+        if c in df.columns:
+            try:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            except Exception:
+                df[c] = df[c].astype(float) if not df[c].empty else 0.0
+
+    return df
+
+
+
+
+
+kpi_order = [
+    "kpi__velocity",
+    "kpi__spillover_pct",
+    "kpi__defect_density_per_100_sp",
+    "kpi__360_sentiment_positive_pct",
+    "kpi__360_sentiment_constructive_pct",
+    "kpi__360_sentiment_mixed_pct",
+    "kpi__story_point_completion_ratio",
+    "kpi__defect_escape_rate",
+    "kpi__rto_compliance_rate",
+    "kpi__copilot_accept_ratio",
+]
