@@ -1,44 +1,9 @@
-# --- BEGIN: force-normalize release_metrics canonical columns BEFORE generic coercion ---
-# Accept many possible header variants and coerce them to canonical names & numeric types.
-if 'release_metrics' in per_table_period:
-    # We may also want to inspect working column names at source; but at merged_all time they are already prefixed.
-    # Candidate prefixed names that might exist (try variants)
-    possible_names = [
-        "release_metrics__defect_rate_ppm",
-        "release_metrics__defect_rate (ppm)",
-        "release_metrics__defect_rate_ppm ",
-        "release_metrics__defect_rateppm",
-        "release_metrics__defect_rate_ppm.0",
-        "release_metrics__on_time",
-        "release_metrics__on time",
-        "release_metrics__rollbacks",
-        "release_metrics__rollback",
-    ]
-
-    # For robustness, find any column that *contains* these key substrings (case-insensitive)
-    for col in list(merged_all.columns):
-        lc = col.lower().replace(" ", "")
-        if "release" in lc and ("defect" in lc and "ppm" in lc):
-            # coerce to numeric and assign canonical name if needed
-            try:
-                merged_all[col] = pd.to_numeric(merged_all[col], errors="coerce").fillna(0)
-            except Exception:
-                merged_all[col] = merged_all[col]
-            # if the canonical name not present, create it and drop the messy variant
-            if "release_metrics__defect_rate_ppm" not in merged_all.columns:
-                merged_all["release_metrics__defect_rate_ppm"] = merged_all[col].astype(float).fillna(0)
-        if "release" in lc and ("on" in lc and "time" in lc):
-            try:
-                merged_all[col] = pd.to_numeric(merged_all[col], errors="coerce").fillna(0).astype(int)
-            except Exception:
-                merged_all[col] = merged_all[col]
-            if "release_metrics__on_time" not in merged_all.columns:
-                merged_all["release_metrics__on_time"] = merged_all[col].fillna(0).astype(int)
-        if "release" in lc and ("rollback" in lc or "rollbacks" in lc):
-            try:
-                merged_all[col] = pd.to_numeric(merged_all[col], errors="coerce").fillna(0)
-            except Exception:
-                merged_all[col] = merged_all[col]
-            if "release_metrics__rollbacks" not in merged_all.columns:
-                merged_all["release_metrics__rollbacks"] = merged_all[col].astype(float).fillna(0)
-# --- END block ---
+# --- Ensure all "*__rows" columns are numeric ints (fixes release_metrics__rows being empty string) ---
+rows_cols = [c for c in merged_all.columns if c.endswith("__rows")]
+for rc in rows_cols:
+    try:
+        merged_all[rc] = pd.to_numeric(merged_all[rc], errors="coerce").fillna(0).astype(int)
+    except Exception:
+        # final fallback: convert to int by manual fill
+        merged_all[rc] = merged_all[rc].apply(lambda x: int(float(x)) if (pd.notna(x) and str(x).strip()!='') else 0)
+# --- end rows normalization ---
