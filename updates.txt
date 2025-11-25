@@ -4,7 +4,8 @@ Periodizer: attach/normalize 'period_half' column on incoming DataFrames.
 
 Special behavior:
  - If key_hint == "idp_goals": do NOT infer period from target_date; missing period_half -> "NA"
- - Otherwise keep the flexible inference rules:
+ - If 'release_id' present (eg. REL-2025-01), extract YYYY and MM and infer half-year
+ - Otherwise:
      - H1/H2 -> DEFAULT_YEAR + H1/H2
      - YYYYH1/ YYYYH2 preserved
      - 'sprint' like "2025H1-S3" -> "2025H1"
@@ -23,6 +24,7 @@ DEFAULT_YEAR = 2025
 
 _sprint_re = re.compile(r"(?P<period>\d{4}H[12])", flags=re.IGNORECASE)
 _yearhalf_re = re.compile(r"(?P<year>\d{4})\s*[ -_]?H(?P<half>[12])", flags=re.IGNORECASE)
+_release_re = re.compile(r"REL[-_]?(\d{4})[-_]?(\d{1,2})", flags=re.IGNORECASE)
 
 
 def _normalize_h1h2(value: str) -> Optional[str]:
@@ -60,6 +62,29 @@ def _infer_from_sprint(s: str) -> Optional[str]:
     return None
 
 
+def _infer_from_release_id(rel: str) -> Optional[str]:
+    """
+    Parse release_id like REL-2025-01 or REL_2025_01 or REL2025-01 and return '2025H1' or '2025H2'
+    """
+    if rel is None:
+        return None
+    s = str(rel).strip()
+    m = _release_re.search(s)
+    if not m:
+        # try looser parse: find 4-digit year and 2-digit month anywhere
+        m2 = re.search(r"(\d{4})[-_]?(\d{2})", s)
+        if m2:
+            year = m2.group(1)
+            month = int(m2.group(2))
+            half = "H1" if month <= 6 else "H2"
+            return f"{year}{half}"
+        return None
+    year = m.group(1)
+    month = int(m.group(2))
+    half = "H1" if month <= 6 else "H2"
+    return f"{year}{half}"
+
+
 def _infer_from_date_value(val) -> Optional[str]:
     if val is None:
         return None
@@ -79,7 +104,7 @@ def attach_period_half(df: pd.DataFrame, key_hint: Optional[str] = None) -> pd.D
     """
     Attach/normalize a `period_half` column to the dataframe.
 
-    key_hint: optional string indicating which table this is (e.g., "idp_goals", "jira_metrics").
+    key_hint: optional string indicating which table this is (e.g., "idp_goals", "jira_metrics", "release_metrics").
     """
     if df is None:
         return df
@@ -107,7 +132,13 @@ def attach_period_half(df: pd.DataFrame, key_hint: Optional[str] = None) -> pd.D
         if mask.any():
             df.loc[mask, "period_half"] = df.loc[mask, "sprint"].apply(lambda v: _infer_from_sprint(v) or pd.NA)
 
-    # 3) month column YYYY-MM (common in rto / github month)
+    # 3) release_id (REL-YYYY-MM) -> infer period from year/month
+    if "release_id" in df.columns:
+        mask = df["period_half"].isna()
+        if mask.any():
+            df.loc[mask, "period_half"] = df.loc[mask, "release_id"].apply(lambda v: _infer_from_release_id(v) or pd.NA)
+
+    # 4) month column YYYY-MM (common in rto / github month)
     if "month" in df.columns:
         mask = df["period_half"].isna()
         if mask.any():
@@ -123,16 +154,15 @@ def attach_period_half(df: pd.DataFrame, key_hint: Optional[str] = None) -> pd.D
                     return None
             df.loc[mask, "period_half"] = df.loc[mask, "month"].apply(from_month_val)
 
-    # 4) If this is IDP goals, DO NOT infer from target_date; set missing explicitly to "NA"
+    # 5) If this is IDP goals, DO NOT infer from target_date; set missing explicitly to "NA"
     if is_idp:
         # preserve any explicit period_half already present; otherwise set to 'NA'
         df["period_half"] = df["period_half"].fillna("").astype(str).str.strip()
         df.loc[df["period_half"] == "", "period_half"] = "NA"
-        # done for idp
         log.info("attach_period_half: key_hint=idp_goals -> missing period_half set to 'NA' (no date inference).")
         return df
 
-    # 5) For non-IDP tables, infer from date-like columns where still missing
+    # 6) For non-IDP tables, infer from date-like columns where still missing
     date_columns_priority = ["date", "completion_date", "created_at", "timestamp", "target_date", "manager_timestamp"]
     for col in date_columns_priority:
         if col in df.columns:
