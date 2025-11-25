@@ -1,170 +1,265 @@
-# src/etl/periodizer.py
-import re
-from pathlib import Path
-from typing import Optional
+# src/features/feature_engineering.py
+"""
+Feature engineering / KPI computation.
+
+Primary function:
+  compute_kpis_from_loaded(loaded: Dict[str, pd.DataFrame]) -> (features_combined_df, features_by_period_df)
+
+Compatibility adapter:
+  compute_kpis(joined_or_loaded) -> same outputs but accepts either the old flattened `joined` DataFrame
+  or the newer `loaded` dict.
+
+Design summary:
+- Aggregate per table into (employee_id, period_half) summaries (sums for numeric columns, counts for object columns).
+- Merge per-table summaries together (left-merge on (employee_id, period_half)).
+- Produce features_by_period (one row per employee per period) and features_combined (one row per employee).
+"""
+from typing import Dict, Tuple, Optional, List
 import pandas as pd
 from ..common.logger import get_logger
 
-log = get_logger("periodizer")
-
-# Default year to assume when only H1/H2 are present
-DEFAULT_YEAR = 2025
-
-_sprint_re = re.compile(r"(?P<period>\d{4}H[12])", flags=re.IGNORECASE)
-_yearhalf_re = re.compile(r"(?P<year>\d{4})\s*[ -_]?H(?P<half>[12])", flags=re.IGNORECASE)
+log = get_logger("feature_engineering")
 
 
-def _normalize_h1h2(value: str) -> Optional[str]:
-    """Normalize values like 'H1' -> '2025H1' (DEFAULT_YEAR) and preserve '2025H1'."""
-    if value is None:
-        return None
-    v = str(value).strip()
-    if not v:
-        return None
-    # direct 2025H1 or 2024H2 etc.
-    m = _yearhalf_re.search(v)
-    if m:
-        year = m.group("year")
-        half = m.group("half")
-        return f"{year}H{half}"
-    # simple H1 / H2 (no year) -> assume DEFAULT_YEAR
-    if v.upper() in ("H1", "H2"):
-        return f"{DEFAULT_YEAR}{v.upper()}"
-    # if already looks like 2025H1 (no dash), accept it
-    m2 = re.match(r"^\d{4}H[12]$", v, flags=re.IGNORECASE)
-    if m2:
-        return v.upper()
-    return None
-
-
-def _infer_from_sprint(s: str) -> Optional[str]:
-    """If sprint contains '2025H1-S3' extract '2025H1'."""
-    if s is None:
-        return None
-    s = str(s)
-    m = _sprint_re.search(s)
-    if m:
-        return m.group("period").upper()
-    # fallback: if sprint contains H1/H2 tokens without year
-    if "H1" in s.upper():
-        return f"{DEFAULT_YEAR}H1"
-    if "H2" in s.upper():
-        return f"{DEFAULT_YEAR}H2"
-    return None
-
-
-def _infer_from_date_value(val) -> Optional[str]:
-    """Given a single date-like value, return period_half like '2025H1' or None."""
-    if val is None:
-        return None
-    try:
-        ts = pd.to_datetime(val, errors="coerce")
-        if pd.isna(ts):
-            return None
-        year = ts.year
-        month = ts.month
-        half = "H1" if month <= 6 else "H2"
-        return f"{year}{half}"
-    except Exception:
-        return None
-
-
-def attach_period_half(df: pd.DataFrame, key_hint: Optional[str] = None) -> pd.DataFrame:
+def _safe_group_agg(df: pd.DataFrame,
+                    group_cols: List[str],
+                    numeric_aggs: Optional[List[str]] = None,
+                    object_aggs: Optional[List[str]] = None) -> pd.DataFrame:
     """
-    Attach/normalize a `period_half` column to the dataframe.
-
-    Rules implemented:
-    - If df already has 'period_half', normalize values (H1/H2 -> 2025H1/2025H2, keep YYYYH1)
-    - If df has 'period' column with H1/H2 values, normalize similarly
-    - If df has 'sprint' column like '2025H1-S3', extract the YYYYH1
-    - If a row ends up with 'unknown', attempt to infer from date-like columns:
-      'date', 'completion_date', 'month', 'created_at', 'timestamp' (in that order)
-      - month in 'YYYY-MM' will be parsed as the first day of that month
-    - If still cannot infer, set 'period_half' = 'unknown'
+    Generic helper:
+      - numeric_aggs: list of numeric columns to sum
+      - object_aggs: list of object columns to count non-null (or first value)
+    Returns aggregated DataFrame (grouped).
     """
-    if df is None:
-        return df
+    if df is None or df.empty:
+        # return empty df with group cols if possible
+        return pd.DataFrame(columns=group_cols)
 
-    df = df.copy()
-    # ensure period_half column exists
-    if "period_half" not in df.columns:
-        df["period_half"] = None
+    # ensure group cols exist
+    for gc in group_cols:
+        if gc not in df.columns:
+            # create the column with NaNs so grouping doesn't fail
+            df[gc] = pd.NA
 
-    # 1) normalize existing 'period_half' and 'period' columns
-    # normalize function will handle H1/H2 or YYYYH1 etc.
+    # normalise period_half to string if present
     if "period_half" in df.columns:
-        df["period_half"] = df["period_half"].apply(lambda v: _normalize_h1h2(v) or (str(v).strip() if pd.notna(v) and str(v).strip() else None))
+        df["period_half"] = df["period_half"].astype(str)
 
-    if "period" in df.columns:
-        # only fill where period_half is missing
-        mask = df["period_half"].isna() | (df["period_half"] == "")
-        if mask.any():
-            df.loc[mask, "period_half"] = df.loc[mask, "period"].apply(lambda v: _normalize_h1h2(v) or None)
+    g = df.groupby(group_cols, dropna=False)
+    agg_ops = {}
 
-    # 2) use sprint column if present (common for jira_metrics)
-    if "sprint" in df.columns:
-        mask = df["period_half"].isna() | (df["period_half"] == "")
-        if mask.any():
-            df.loc[mask, "period_half"] = df.loc[mask, "sprint"].apply(lambda v: _infer_from_sprint(v) or None)
+    if numeric_aggs:
+        for c in numeric_aggs:
+            if c in df.columns:
+                agg_ops[c] = "sum"
+    if object_aggs:
+        for c in object_aggs:
+            if c in df.columns:
+                # count non-null occurrences
+                agg_ops[c] = lambda s: s.notna().sum()
 
-    # 3) For specific keys where values may be H1/H2 (manager_evaluations, workday_checkins),
-    #    we want to map raw 'H1'/'H2' as well (already handled by _normalize_h1h2 if present in period)
-    #    So nothing extra needed here.
+    # always include row count
+    agg_ops["_rows"] = ("employee_id", "count")
 
-    # 4) For tables where 'month' is in YYYY-MM, parse it
-    if "month" in df.columns:
-        mask = df["period_half"].isna() | (df["period_half"] == "")
-        if mask.any():
-            def from_month_val(v):
-                try:
-                    if pd.isna(v):
-                        return None
-                    s = str(v).strip()
-                    # if it's already YYYY-MM or YYYY-M
-                    if re.match(r"^\d{4}-\d{1,2}$", s):
-                        return _infer_from_date_value(s + "-01")
-                    # if it's a proper datetime-like string
-                    return _infer_from_date_value(s)
-                except Exception:
-                    return None
-            df.loc[mask, "period_half"] = df.loc[mask, "month"].apply(from_month_val)
-
-    # 5) For rows still unknown, try to infer from date columns
-    date_columns_priority = ["date", "completion_date", "created_at", "timestamp", "manager_timestamp"]
-    for col in date_columns_priority:
-        if col in df.columns:
-            mask = df["period_half"].isna() | (df["period_half"] == "")
-            if not mask.any():
-                break
-            df.loc[mask, "period_half"] = df.loc[mask, col].apply(lambda v: _infer_from_date_value(v))
-
-    # Replace any remaining empty strings / NaN with explicit "unknown"
-    df["period_half"] = df["period_half"].fillna("").astype(str).str.strip()
-    df.loc[df["period_half"] == "", "period_half"] = "unknown"
-
-    # final normalization: enforce uppercase like '2025H1'
-    def _final_norm(val):
-        if val is None:
-            return "unknown"
-        v = str(val).strip()
-        if v.lower() == "unknown" or v == "":
-            return "unknown"
-        # if looks like H1/H2 only
-        if re.match(r"^H[12]$", v, flags=re.IGNORECASE):
-            return f"{DEFAULT_YEAR}{v.upper()}"
-        # match 4-digit year + H1/H2
-        if re.match(r"^\d{4}H[12]$", v, flags=re.IGNORECASE):
-            return v.upper()
-        # fallback: unknown
-        return "unknown"
-
-    df["period_half"] = df["period_half"].apply(_final_norm)
-
-    # log summary stats
     try:
-        counts = df["period_half"].value_counts(dropna=False).to_dict()
-        log.info("attach_period_half(%s) produced period counts: %s", key_hint or "", counts)
+        out = g.agg(agg_ops).reset_index()
     except Exception:
-        pass
+        # fallback: just return counts
+        out = g.size().reset_index().rename(columns={0: "_rows"})
+    return out
 
-    return df
+
+def compute_kpis_from_loaded(loaded: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute KPIs using the `loaded` dict (dataframes).
+    Returns:
+      - features_combined_df: one row per employee (aggregated across periods)
+      - features_by_period_df: one row per employee per period (period_half)
+    """
+
+    per_table_period = {}
+
+    # defects
+    df = loaded.get("defects")
+    if df is not None:
+        numeric = []
+        object_cols = []
+        # escaped_to_prod boolean -> treat as numeric (count of True)
+        if "escaped_to_prod" in df.columns:
+            numeric.append("escaped_to_prod")
+        # severity -> count occurrences (object agg)
+        if "severity" in df.columns:
+            object_cols.append("severity")
+        per_table_period["defects"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=numeric, object_aggs=object_cols)
+
+    # jira_metrics
+    df = loaded.get("jira_metrics")
+    if df is not None:
+        numeric_cols = [c for c in ["story_points_committed", "story_points_completed", "spillover_points", "bugs_introduced", "bugs_fixed"] if c in df.columns]
+        per_table_period["jira"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=numeric_cols, object_aggs=None)
+
+    # github_metrics
+    df = loaded.get("github_metrics")
+    if df is not None:
+        numeric_cols = [c for c in ["commits", "pull_requests", "reviews_done", "copilot_suggestions_accepted", "copilot_suggestions_total"] if c in df.columns]
+        per_table_period["github"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=numeric_cols, object_aggs=None)
+
+    # feedback_360
+    df = loaded.get("feedback_360")
+    if df is not None:
+        # sentiment counts (positive/constructive/mixed) are captured as counts via object agg
+        obj_cols = ["sentiment"] if "sentiment" in df.columns else None
+        per_table_period["feedback"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=None, object_aggs=obj_cols)
+
+    # rto
+    df = loaded.get("rto")
+    if df is not None:
+        numeric_cols = [c for c in ["required_days", "in_office_days"] if c in df.columns]
+        if "compliant" in df.columns:
+            numeric_cols.append("compliant")
+        per_table_period["rto"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=numeric_cols, object_aggs=None)
+
+    # lms_completions
+    df = loaded.get("lms_completions")
+    if df is not None:
+        numeric_cols = [c for c in ["hours", "score"] if c in df.columns]
+        per_table_period["lms"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=numeric_cols, object_aggs=None)
+
+    # recognition
+    df = loaded.get("recognition")
+    if df is not None:
+        per_table_period["recognition"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=None, object_aggs=["type"] if "type" in df.columns else None)
+
+    # idp_goals
+    df = loaded.get("idp_goals")
+    if df is not None:
+        obj_cols = ["status"] if "status" in df.columns else None
+        per_table_period["idp"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=None, object_aggs=obj_cols)
+
+    # manager_evaluations
+    df = loaded.get("manager_evaluations")
+    if df is not None:
+        obj_cols = []
+        if "rating" in df.columns:
+            obj_cols.append("rating")
+        if "bias_type" in df.columns:
+            obj_cols.append("bias_type")
+        per_table_period["mgr_eval"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=None, object_aggs=obj_cols)
+
+    # workday_checkins
+    df = loaded.get("workday_checkins")
+    if df is not None:
+        obj_cols = ["sentiment"] if "sentiment" in df.columns else None
+        per_table_period["checkins"] = _safe_group_agg(df, ["employee_id", "period_half"], numeric_aggs=None, object_aggs=obj_cols)
+
+    # Build the canonical set of (employee_id, period_half) keys
+    all_keys = []
+    for name, agg_df in per_table_period.items():
+        if agg_df is None or agg_df.empty:
+            continue
+        if {"employee_id", "period_half"}.issubset(agg_df.columns):
+            all_keys.append(agg_df[["employee_id", "period_half"]].drop_duplicates())
+
+    if all_keys:
+        keys_df = pd.concat(all_keys, ignore_index=True).drop_duplicates().reset_index(drop=True)
+    else:
+        # fallback to employees table
+        emp_df = loaded.get("employees")
+        if emp_df is not None and "employee_id" in emp_df.columns:
+            keys_df = emp_df[["employee_id"]].drop_duplicates().assign(period_half="unknown")
+        else:
+            keys_df = pd.DataFrame(columns=["employee_id", "period_half"])
+
+    merged = keys_df.copy()
+
+    # sequentially merge in prefixed aggregated tables
+    for name, agg_df in per_table_period.items():
+        if agg_df is None or agg_df.empty:
+            continue
+        pref = f"{name}__"
+        # rename all non-key cols
+        agg_copy = agg_df.copy()
+        for c in agg_copy.columns:
+            if c not in ("employee_id", "period_half"):
+                agg_copy = agg_copy.rename(columns={c: pref + c})
+        merged = merged.merge(agg_copy, on=["employee_id", "period_half"], how="left")
+
+    # Fill NAs with 0 for numeric-like columns
+    for c in merged.columns:
+        if c in ("employee_id", "period_half"):
+            continue
+        try:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
+        except Exception:
+            # if cannot coerce, fill NaNs with 0 anyway to keep consistency
+            merged[c] = merged[c].fillna(0)
+
+    features_by_period_df = merged
+
+    # features_combined: aggregate across periods per employee (sum numeric columns)
+    if not features_by_period_df.empty:
+        numeric_cols = [c for c in features_by_period_df.columns if c not in ("employee_id", "period_half")]
+        features_combined_df = features_by_period_df.groupby("employee_id", dropna=False)[numeric_cols].sum().reset_index()
+    else:
+        features_combined_df = pd.DataFrame(columns=["employee_id"])
+
+    log.info("Feature engineering produced: features_by_period rows=%s, features_combined rows=%s",
+             len(features_by_period_df), len(features_combined_df))
+
+    return features_combined_df, features_by_period_df
+
+
+def compute_kpis(joined_or_loaded) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compatibility adapter.
+
+    If passed a dict (the `loaded` dict), call compute_kpis_from_loaded.
+    If passed a DataFrame (the old 'joined' flattened table), aggregate per-employee and per-period (best-effort).
+    Returns (features_combined_df, features_by_period_df)
+    """
+    # If it's a dict, assume the loaded dict
+    if isinstance(joined_or_loaded, dict):
+        return compute_kpis_from_loaded(joined_or_loaded)
+
+    # If it's a DataFrame, attempt to derive period-based aggregates
+    if isinstance(joined_or_loaded, pd.DataFrame):
+        joined = joined_or_loaded.copy()
+        # ensure expected columns exist
+        if "employee_id" not in joined.columns:
+            raise ValueError("Joined dataframe must contain 'employee_id' column")
+        # ensure period_half exists (if not, try to use 'period' or set unknown)
+        if "period_half" not in joined.columns:
+            if "period" in joined.columns:
+                joined["period_half"] = joined["period"].astype(str)
+            else:
+                joined["period_half"] = "unknown"
+
+        # For a flattened joined df we will sum numeric columns per employee+period and count rows
+        # pick numeric columns automatically (exclude obvious non-metric columns)
+        metric_cols = [c for c in joined.columns if c not in ("employee_id", "period_half", "period", "name", "emp_role", "role")]
+        # coerce numeric where possible
+        numeric_cols = []
+        for c in metric_cols:
+            try:
+                joined[c] = pd.to_numeric(joined[c], errors="coerce")
+                numeric_cols.append(c)
+            except Exception:
+                # non-numeric columns will be counted instead
+                pass
+
+        g = joined.groupby(["employee_id", "period_half"], dropna=False)
+        if numeric_cols:
+            agg = g[numeric_cols].sum().reset_index()
+        else:
+            agg = g.size().reset_index().rename(columns={0: "_rows"})
+
+        features_by_period_df = agg
+        # combined
+        if not features_by_period_df.empty:
+            numeric_cols = [c for c in features_by_period_df.columns if c not in ("employee_id", "period_half")]
+            features_combined_df = features_by_period_df.groupby("employee_id", dropna=False)[numeric_cols].sum().reset_index()
+        else:
+            features_combined_df = pd.DataFrame(columns=["employee_id"])
+        return features_combined_df, features_by_period_df
+
+    raise ValueError("Unsupported input to compute_kpis: must be either loaded dict or joined DataFrame")
