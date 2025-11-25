@@ -1,10 +1,12 @@
 # src/features/feature_engineering.py
 """
-Feature engineering (updated)
+Feature engineering (release_metrics fix + skip red_flag_dictionary rows)
 
-- Coerce release_metrics numeric fields early so they are numeric in period + combined.
-- Convert selected text concat fields into subarrays (list of dicts), with red_flag detection for manager/workday/areas.
-- Keeps kpi__ prefixed KPIs and existing behaviors (idp only in combined, column ordering).
+Changes:
+ - Normalize and coerce release_metrics columns early so they never become strings.
+ - Skip red_flag_dictionary table for per-period aggregation (no red_flag_dictionary__rows).
+ - Preserve text subarrays and normalize missing text cells to [].
+ - Keeps all other behaviors (kpi__ prefixed KPIs, idp only in combined, column ordering).
 """
 from typing import Dict, Tuple, List, Optional, Any
 import pandas as pd
@@ -41,6 +43,8 @@ COLUMN_TABLE_ORDER = [
     "github_metrics",
     "jira_metrics",
 ]
+
+SKIP_TABLES_FOR_PERIOD = {"employees", "employee", "employee.csv", "idp_goals", "red_flag_dictionary", "red_flag_dictionary.csv"}
 
 def _bool_to_int_series(s: pd.Series) -> pd.Series:
     if s is None:
@@ -185,9 +189,6 @@ def _merge_prefix(df: pd.DataFrame, prefix: str, group_cols: List[str]) -> pd.Da
     return out
 
 def _detect_red_flags(text: str, red_terms: List[str]) -> List[str]:
-    """
-    Return list of red_flag terms found in text (case-insensitive substring match).
-    """
     if not text or not isinstance(text, str):
         return []
     t = text.lower()
@@ -196,21 +197,12 @@ def _detect_red_flags(text: str, red_terms: List[str]) -> List[str]:
 
 def _aggregate_text_subarray(df: pd.DataFrame, group_cols: List[str], text_col: str, item_key: str,
                              include_red_flag: bool, red_terms: List[str]) -> pd.DataFrame:
-    """
-    Aggregate rows into a list-of-dicts per group.
-    - text_col: column in df containing the text (e.g., "manager_comment")
-    - item_key: the key name in the dict (e.g., "comment" or "summary" or "area")
-    - include_red_flag: whether to include red_flag_trigger for each item
-    Returns DataFrame with group_cols + [f"{table}__{text_col}"] where value is list of dicts.
-    """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame(columns=group_cols + [text_col])
     working = df.copy()
-    # ensure group_cols present
     for gc in group_cols:
         if gc not in working.columns:
             working[gc] = "unknown"
-    # build grouped lists
     def make_list(sub):
         items = []
         for idx, row in sub.iterrows():
@@ -222,7 +214,6 @@ def _aggregate_text_subarray(df: pd.DataFrame, group_cols: List[str], text_col: 
                 entry["red_flag_trigger"] = _detect_red_flags(txt, red_terms or [])
             items.append(entry)
         return items
-
     grouped = working.groupby(group_cols, sort=False).apply(lambda g: make_list(g)).reset_index().rename(columns={0: text_col})
     return grouped
 
@@ -237,37 +228,24 @@ def _derive_safe_ratios(merged: pd.DataFrame) -> pd.DataFrame:
             return (a / b) * scale
         except Exception:
             return 0.0
-
     comp_col = df.get("jira_metrics__story_points_completed", pd.Series(0, index=df.index))
     comm_col = df.get("jira_metrics__story_points_committed", pd.Series(0, index=df.index))
     df["kpi__story_point_completion_ratio"] = [safe_div(a, b) for a, b in zip(comp_col.fillna(0), comm_col.fillna(0))]
-
     df["kpi__defect_escape_rate"] = df.apply(lambda r: safe_div(r.get("defects__escaped_to_prod", 0), r.get("defects___rows", 0)), axis=1)
-
     df["kpi__rto_compliance_rate"] = df.apply(lambda r: safe_div(r.get("rto__in_office_days", 0), r.get("rto__required_days", 0), scale=100.0), axis=1)
     df["kpi__rto_compliance_rate"] = df["kpi__rto_compliance_rate"].clip(upper=100.0)
-
     df["kpi__copilot_accept_ratio"] = df.apply(lambda r: safe_div(r.get("github_metrics__copilot_suggestions_accepted", 0), r.get("github_metrics__copilot_suggestions_total", 0)), axis=1)
-
     return df
 
 def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[str], red_terms: List[str]) -> pd.DataFrame:
-    """
-    For special tables that need text as subarrays:
-      - feedback_360: produce feedback_360__comment (list of {"comment": ...})
-      - workday_checkins: produce workday_checkins__summary (list of {"summary": ..., "red_flag_trigger":[...]})
-      - manager_evaluations: produce manager_evaluations__manager_comment and manager_evaluations__areas_of_focus (list of dicts with red flag)
-    """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame(columns=group_cols)
     d = df.copy()
     for gc in group_cols:
         if gc not in d.columns:
             d[gc] = "unknown"
-
     results = _base_row_counts(d, group_cols)
     results = _merge_prefix(results, key, group_cols)
-
     if key == "feedback_360":
         if "sentiment" in d.columns:
             sent_agg = _expand_categorical_counts(d, group_cols, ["sentiment"])
@@ -279,7 +257,6 @@ def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[
             comments = _merge_prefix(comments, key, group_cols)
             if not comments.empty:
                 results = results.merge(comments, on=group_cols, how="left")
-
     if key == "workday_checkins":
         if "type" in d.columns:
             type_agg = _expand_categorical_counts(d, group_cols, ["type"])
@@ -296,7 +273,6 @@ def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[
             summaries = _merge_prefix(summaries, key, group_cols)
             if not summaries.empty:
                 results = results.merge(summaries, on=group_cols, how="left")
-
     if key == "manager_evaluations":
         if "manager_comment" in d.columns:
             mgr_comments = _aggregate_text_subarray(d, group_cols, "manager_comment", "comment", include_red_flag=True, red_terms=red_terms)
@@ -308,92 +284,83 @@ def _process_text_fields_for_table(key: str, df: pd.DataFrame, group_cols: List[
             areas = _merge_prefix(areas, key, group_cols)
             if not areas.empty:
                 results = results.merge(areas, on=group_cols, how="left")
-
-    # do not coerce the subarray columns; ensure they exist
     return results
 
 def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if not isinstance(loaded_raw, dict):
         raise ValueError("compute_kpis_from_loaded expects a dict of DataFrames")
-
     loaded = _normalize_loaded_keys(loaded_raw)
     per_table_period: Dict[str, pd.DataFrame] = {}
     group_cols = ["employee_id", "period_half"]
-
-    # prepare red flag terms if provided
     red_terms = []
     red_df = loaded.get("red_flag_dictionary")
     if isinstance(red_df, pd.DataFrame) and "red_flag_term" in red_df.columns:
         red_terms = [str(x).strip().lower() for x in red_df["red_flag_term"].dropna().unique().tolist()]
-
     for key, df in loaded.items():
         try:
-            # skip employees table for period-level (avoid employees___rows)
-            if key in ("employees", "employee", "employee.csv"):
+            if key in SKIP_TABLES_FOR_PERIOD:
                 per_table_period[key] = None
                 continue
-
             if df is None or not isinstance(df, pd.DataFrame) or df.empty:
                 per_table_period[key] = None
                 continue
-
             working = df.copy()
-
-            # ensure employee_id and period_half exist
             for gc in group_cols:
                 if gc not in working.columns:
                     working[gc] = "unknown"
-
-            # special text tables -> produce subarrays
+            # handle release_metrics: normalize column names to canonical ones before aggregation
+            if key == "release_metrics":
+                # build mapping from existing column names to canonical names
+                col_map = {}
+                for col in working.columns:
+                    lc = col.lower().strip()
+                    if "defect" in lc and ("ppm" in lc or "defect_rate" in lc):
+                        col_map[col] = "defect_rate_ppm"
+                    elif "on_time" in lc or "on time" in lc:
+                        col_map[col] = "on_time"
+                    elif "rollback" in lc or "rollbacks" in lc:
+                        col_map[col] = "rollbacks"
+                if col_map:
+                    working = working.rename(columns=col_map)
+                # coerce canonical columns
+                for c in ("defect_rate_ppm", "on_time", "rollbacks"):
+                    if c in working.columns:
+                        if c == "on_time":
+                            try:
+                                working[c] = _bool_to_int_series(working[c])
+                            except Exception:
+                                working[c] = pd.to_numeric(working[c], errors="coerce")
+                        else:
+                            try:
+                                working[c] = pd.to_numeric(working[c], errors="coerce")
+                            except Exception:
+                                working[c] = working[c]
+            # text-special tables
             if key in ("feedback_360", "workday_checkins", "manager_evaluations"):
                 txt_agg = _process_text_fields_for_table(key, working, group_cols, red_terms)
                 per_table_period[key] = txt_agg
                 continue
-
-            # skip idp_goals in period-level (handled only in combined)
+            # skip idp_goals already handled
             if key == "idp_goals":
                 per_table_period[key] = None
                 continue
-
-            # For release_metrics: coerce critical columns BEFORE aggregation to avoid string values
-            if key == "release_metrics":
-                for col in ("defect_rate_ppm", "on_time", "rollbacks"):
-                    if col in working.columns:
-                        if col == "on_time":
-                            # boolean -> int
-                            try:
-                                working[col] = _bool_to_int_series(working[col])
-                            except Exception:
-                                working[col] = pd.to_numeric(working[col], errors="coerce")
-                        else:
-                            try:
-                                working[col] = pd.to_numeric(working[col], errors="coerce")
-                            except Exception:
-                                working[col] = working[col]
-
-            # generic numeric/categorical handling
             hints = NUMERIC_HINTS.get(key, [])
             numeric_candidates = _guess_numeric_cols(working, hints)
-
-            # ensure boolean-like columns are included
             for bool_like in ("escaped_to_prod", "on_time", "compliant"):
                 if bool_like in working.columns and bool_like not in numeric_candidates:
                     numeric_candidates.append(bool_like)
-
             numeric_agg = _safe_numeric_sum_agg(working, group_cols, numeric_candidates)
             numeric_agg = _merge_prefix(numeric_agg, key, group_cols) if not numeric_agg.empty else pd.DataFrame(columns=group_cols)
             cat_agg = _expand_categorical_counts(working, group_cols, CATEGORICAL_EXPAND)
             cat_agg = _merge_prefix(cat_agg, key, group_cols) if not cat_agg.empty else pd.DataFrame(columns=group_cols)
             rows_agg = _base_row_counts(working, group_cols)
             rows_agg = _merge_prefix(rows_agg, key, group_cols)
-
             merged = rows_agg
             if not numeric_agg.empty:
                 merged = merged.merge(numeric_agg, on=group_cols, how="left")
             if not cat_agg.empty:
                 merged = merged.merge(cat_agg, on=group_cols, how="left")
-
-            # ensure release_metrics prefixed columns are numeric if they exist (extra safety)
+            # ensure release_metrics prefixed columns numeric if exist
             if key == "release_metrics":
                 for col in ("release_metrics__defect_rate_ppm", "release_metrics__on_time", "release_metrics__rollbacks"):
                     if col in merged.columns:
@@ -401,15 +368,12 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
                             merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
                         except Exception:
                             merged[col] = merged[col].fillna(0)
-
             # post-merge coercion: preserve subarray/text columns, coerce numeric/boolean
             for col in merged.columns:
                 if col in group_cols:
                     continue
                 if TEXT_NAME_PATTERNS.search(col):
-                    # these columns may be missing (if no rows) - ensure list form
-                    merged[col] = merged[col].where(merged[col].notna(), "")
-                    # we keep as-is here; later we'll convert "" -> [] or preserve list objects
+                    merged[col] = merged[col].where(merged[col].notna(), [])
                     continue
                 lname = col.lower()
                 if lname.endswith("__escaped_to_prod") or lname.endswith("__on_time") or lname.endswith("__compliant"):
@@ -422,14 +386,11 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
                         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
                     except Exception:
                         merged[col] = merged[col].fillna("")
-
             per_table_period[key] = merged
-
         except Exception as e:
             log.exception("Error processing table %s: %s", key, e)
             per_table_period[key] = None
-
-    # Build canonical key set (exclude employee unknown and period unknown)
+    # Build canonical keys - exclude unknowns
     key_frames = []
     for k, agg_df in per_table_period.items():
         if agg_df is None or not isinstance(agg_df, pd.DataFrame) or agg_df.empty:
@@ -450,10 +411,8 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
             keys_df = emp_df[["employee_id"]].drop_duplicates().assign(period_half="NA")
         else:
             keys_df = pd.DataFrame(columns=group_cols)
-
     merged_all = keys_df.copy()
-
-    # Merge per-table aggregates (skip idp_goals)
+    # Merge per-table aggregates (skip idp_goals & red_flag_dictionary)
     for name, agg in per_table_period.items():
         if agg is None or not isinstance(agg, pd.DataFrame) or agg.empty:
             continue
@@ -464,14 +423,12 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
         agg2 = agg2[agg2["employee_id"].astype(str).str.strip() != ""]
         agg2 = agg2[agg2["employee_id"].astype(str).str.lower() != "unknown"]
         merged_all = merged_all.merge(agg2, on=group_cols, how="left")
-
-    # Turn empty text placeholders into empty lists and coerce numeric
+    # Normalize text subarray cells to [] and coerce numerics
     for col in merged_all.columns:
         if col in group_cols:
             continue
         if TEXT_NAME_PATTERNS.search(col):
-            # if cell is empty string or NaN -> convert to empty list
-            merged_all[col] = merged_all[col].apply(lambda x: x if isinstance(x, list) else ( [] if pd.isna(x) or x == "" else x ))
+            merged_all[col] = merged_all[col].apply(lambda x: x if isinstance(x, list) else ([] if pd.isna(x) or x == "" else x))
             continue
         try:
             coerced = pd.to_numeric(merged_all[col], errors="coerce")
@@ -481,19 +438,15 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
                 merged_all[col] = merged_all[col].fillna("").astype(str)
         except Exception:
             merged_all[col] = merged_all[col].fillna("").astype(str)
-
     features_by_period_df = merged_all
-
     # Derived KPIs at period level
     features_by_period_df = _derive_safe_ratios(features_by_period_df)
-
-    # Build combined features: aggregate numeric columns
+    # Build combined features
     if not features_by_period_df.empty:
         numeric_cols = [c for c in features_by_period_df.columns if c not in group_cols and pd.api.types.is_numeric_dtype(features_by_period_df[c])]
         features_combined_df = features_by_period_df.groupby("employee_id", dropna=False)[numeric_cols].sum().reset_index()
     else:
         features_combined_df = pd.DataFrame(columns=["employee_id"])
-
     # IDP combined-only
     idp_df = loaded.get("idp_goals")
     if isinstance(idp_df, pd.DataFrame) and not idp_df.empty:
@@ -533,24 +486,20 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
             features_combined_df = features_combined_df.merge(idp_combined, on="employee_id", how="left")
         else:
             features_combined_df = features_combined_df.merge(idp_combined, on="employee_id", how="right")
-
-    # Combine text subarrays across periods into combined (union/order preserved)
+    # Combine text subarrays across periods into combined
     text_cols = [c for c in features_by_period_df.columns if isinstance(c, str) and TEXT_NAME_PATTERNS.search(c)]
     for tc in text_cols:
-        # aggregate lists: take lists and concatenate them
         def flatten_lists(s):
             out = []
             for v in s:
                 if isinstance(v, list):
                     out.extend(v)
                 elif isinstance(v, str) and v.strip():
-                    # unexpected string: keep as single-item dict under generic key
                     out.append({"text": v})
             return out
         combined_text = features_by_period_df.groupby("employee_id")[tc].apply(lambda s: flatten_lists(s.tolist())).reset_index().rename(columns={tc: tc})
         features_combined_df = features_combined_df.merge(combined_text, on="employee_id", how="left")
-
-    # Ensure boolean-like aggregated columns numeric in combined
+    # Ensure boolean-like aggregated columns are numeric ints in combined
     for col in features_combined_df.columns:
         lname = col.lower()
         if lname.endswith("escaped_to_prod") or lname.endswith("on_time") or lname.endswith("compliant"):
@@ -558,13 +507,11 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
                 features_combined_df[col] = pd.to_numeric(features_combined_df[col], errors="coerce").fillna(0).astype(int)
             except Exception:
                 features_combined_df[col] = features_combined_df[col].fillna(0)
-
     # Recompute KPIs on combined and cap rto at 100
     features_combined_df = _derive_safe_ratios(features_combined_df)
     if "kpi__rto_compliance_rate" in features_combined_df.columns:
         features_combined_df["kpi__rto_compliance_rate"] = features_combined_df["kpi__rto_compliance_rate"].clip(upper=100.0)
-
-    # Merge employee metadata on top (employee_id, name, role, org)
+    # Merge employee metadata (role, org, name)
     emp_df = loaded.get("employees")
     if isinstance(emp_df, pd.DataFrame) and "employee_id" in emp_df.columns:
         pick = ["employee_id"]
@@ -576,8 +523,7 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
             pick.append("org")
         emp_meta = emp_df[pick].drop_duplicates(subset=["employee_id"])
         features_combined_df = features_combined_df.merge(emp_meta, on="employee_id", how="left")
-
-    # Column ordering enforcement (metadata top, then table groups, idp only in combined, then kpis)
+    # Column ordering enforcement
     def enforce_column_order(df: pd.DataFrame, is_period: bool) -> pd.DataFrame:
         cols = []
         cols.extend(["employee_id"])
@@ -587,21 +533,16 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
         if is_period:
             cols.append("period_half")
         for t in COLUMN_TABLE_ORDER:
-            pref = f"{t}__"
             rows_col = f"{t}__rows"
-            # rows first if present
             if rows_col in df.columns and rows_col not in cols:
                 cols.append(rows_col)
-            # then other columns from that table
-            matching = sorted([c for c in df.columns if c.startswith(pref) and c not in cols])
+            matching = sorted([c for c in df.columns if c.startswith(f"{t}__") and c not in cols])
             cols.extend(matching)
-        # idp for combined
         if not is_period:
             idp_cols = sorted([c for c in df.columns if c.startswith("idp_goals__") or c.startswith("idp_goals___")])
             for c in idp_cols:
                 if c not in cols:
                     cols.append(c)
-        # KPIs at end
         kpi_order = [
             "kpi__story_point_completion_ratio",
             "kpi__defect_escape_rate",
@@ -611,15 +552,12 @@ def compute_kpis_from_loaded(loaded_raw: Dict[str, Any]) -> Tuple[pd.DataFrame, 
         for k in kpi_order:
             if k in df.columns and k not in cols:
                 cols.append(k)
-        # remaining columns
         remaining = [c for c in df.columns if c not in cols]
         cols.extend(sorted(remaining))
         final_cols = [c for c in cols if c in df.columns]
         return df[final_cols]
-
     features_by_period_df = enforce_column_order(features_by_period_df, is_period=True)
     features_combined_df = enforce_column_order(features_combined_df, is_period=False)
-
     log.info("compute_kpis_from_loaded: produced features_by_period rows=%s, features_combined rows=%s",
              len(features_by_period_df), len(features_combined_df))
     return features_combined_df, features_by_period_df
