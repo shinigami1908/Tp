@@ -1,91 +1,212 @@
-def _derive_safe_ratios(merged: pd.DataFrame) -> pd.DataFrame:
-    df = merged.copy()
+# src/features/scoring_rules.py
 
-    # helper ensures we always get a vector, never a scalar
-    def s(col):
-        if col in df.columns:
-            return pd.to_numeric(df[col], errors="coerce").fillna(0)
-        return pd.Series([0] * len(df), dtype=float)
+"""
+Per-employee, per-period scoring & bias detection.
 
-    def safe_div(a, b, scale=1.0):
-        a = float(a) if a not in (None, "", "nan", np.nan) else 0.0
-        b = float(b) if b not in (None, "", "nan", np.nan, 0) else 0.0
-        if b == 0:
-            return 0.0
-        return (a / b) * scale
+Inputs:
+    - features_by_period_df: output of compute_kpis(...)[1]
+    - loaded: dict of original DataFrames (from run_etl()['loaded'])
 
-    # --- KPIs ---
+Adds to features_by_period_df:
+    * mgr_rating               (manager's rating from manager_evaluations.csv)
+    * kpi__expected_score      (0–1 heuristic score)
+    * kpi__expected_rating     (text rating derived from expected_score)
+    * bias__flag               (1 if strong mismatch between manager & expected rating, else 0)
+    * bias__direction          ("manager_higher" / "manager_lower" / "aligned")
+"""
 
-    # velocity
-    df["kpi__velocity"] = s("jira_metrics__story_points_completed")
+from typing import Dict, Any
+import pandas as pd
+import numpy as np
 
-    # spillover %
-    df["kpi__spillover_pct"] = [
-        safe_div(spill, comm, 100.0)
-        for spill, comm in zip(
-            s("jira_metrics__spillover_points"),
-            s("jira_metrics__story_points_committed")
+
+# canonical rating levels
+RATING_SCALE = {
+    "needs improvement": 1,
+    "inconsistently meets": 2,
+    "meets": 3,
+    "exceeds": 4,
+    "consistently exceeds": 5,
+}
+
+
+def _rating_to_level(rating: str) -> int:
+    if not isinstance(rating, str):
+        return 0
+    return RATING_SCALE.get(rating.strip().lower(), 0)
+
+
+def _level_to_rating(score: float) -> str:
+    """
+    Map numeric expected_score in [0, 1] to a textual rating.
+    Thresholds can be tweaked.
+    """
+    if score >= 0.80:
+        return "Consistently Exceeds"
+    if score >= 0.60:
+        return "Exceeds"
+    if score >= 0.40:
+        return "Meets"
+    if score >= 0.25:
+        return "Inconsistently Meets"
+    return "Needs Improvement"
+
+
+def _score_row(row: pd.Series) -> float:
+    """
+    Heuristic scoring per employee-period based on KPIs.
+
+    Uses (if present):
+      - kpi__velocity
+      - kpi__spillover_pct
+      - kpi__defect_density_per_100_sp
+      - kpi__360_sentiment_positive_pct
+      - kpi__copilot_accept_ratio
+      - kpi__rto_compliance_rate
+      - release_metrics__defect_rate_ppm
+
+    Total score capped at 1.0.
+    """
+
+    def v(name: str, default: float = 0.0) -> float:
+        val = row.get(name, default)
+        try:
+            if val is None or val == "" or (isinstance(val, float) and np.isnan(val)):
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    score = 0.0
+
+    # --- Delivery: spillover + velocity ---
+    spill = v("kpi__spillover_pct")          # lower is better
+    if spill <= 10:
+        score += 0.20
+    elif spill <= 25:
+        score += 0.10
+
+    velocity = v("kpi__velocity")            # higher is better
+    if velocity >= 50:
+        score += 0.20
+    elif velocity >= 20:
+        score += 0.10
+
+    # --- Quality: defect density per 100 SP ---
+    dd = v("kpi__defect_density_per_100_sp")  # lower is better
+    if dd <= 5:
+        score += 0.20
+    elif dd <= 10:
+        score += 0.10
+
+    # --- 360 Sentiment: positive % ---
+    pos = v("kpi__360_sentiment_positive_pct")
+    if pos >= 70:
+        score += 0.10
+    elif pos >= 50:
+        score += 0.05
+
+    # --- Copilot / innovation ---
+    cop = v("kpi__copilot_accept_ratio")
+    if cop >= 0.50:
+        score += 0.10
+    elif cop >= 0.25:
+        score += 0.05
+
+    # --- RTO compliance ---
+    rto = v("kpi__rto_compliance_rate")
+    if rto >= 90:
+        score += 0.10
+    elif rto >= 75:
+        score += 0.05
+
+    # --- Release quality (if available) ---
+    ppm_raw = row.get("release_metrics__defect_rate_ppm", None)
+    if ppm_raw is not None and ppm_raw != "":
+        try:
+            ppm = float(ppm_raw)
+            if ppm <= 100:
+                score += 0.10
+            elif ppm <= 300:
+                score += 0.05
+        except Exception:
+            pass
+
+    return float(min(score, 1.0))
+
+
+def apply_scoring_rules(
+    features_by_period_df: pd.DataFrame,
+    loaded: Dict[str, Any],
+) -> pd.DataFrame:
+    """
+    Attach mgr_rating, expected score/rating and bias flags to the
+    per-period feature frame.
+    """
+    if features_by_period_df is None or features_by_period_df.empty:
+        return features_by_period_df
+
+    df = features_by_period_df.copy()
+
+    # --- 1) Bring in manager rating from manager_evaluations.csv ---
+    mgr_df = None
+    if isinstance(loaded, dict):
+        mgr_df = loaded.get("manager_evaluations")
+
+    if isinstance(mgr_df, pd.DataFrame) and not mgr_df.empty:
+        md = mgr_df.copy()
+
+        # ensure period_half exists in manager_evaluations
+        if "period_half" not in md.columns:
+            if "period" in md.columns:
+                md["period_half"] = md["period"].astype(str)
+            else:
+                md["period_half"] = "NA"
+
+        cols = [c for c in ["employee_id", "period_half", "rating"] if c in md.columns]
+        md = md[cols].dropna(subset=["employee_id"]).copy()
+
+        # assume at most one rating per employee+period; if multiple, take last
+        md = (
+            md.sort_values(by=["employee_id", "period_half"])
+            .drop_duplicates(subset=["employee_id", "period_half"], keep="last")
+            .rename(columns={"rating": "mgr_rating"})
         )
-    ]
 
-    # defect density per 100 story points
-    df["kpi__defect_density_per_100_sp"] = [
-        safe_div(defects, completed, 100.0)
-        for defects, completed in zip(
-            s("defects___rows"),
-            s("jira_metrics__story_points_completed")
-        )
-    ]
+        df = df.merge(md, on=["employee_id", "period_half"], how="left")
+    else:
+        # no manager evaluations – still create column for consistency
+        df["mgr_rating"] = ""
 
-    # 360 sentiment %
-    fb_rows = s("feedback_360___rows")
-    df["kpi__360_sentiment_positive_pct"] = [
-        safe_div(pos, total, 100.0)
-        for pos, total in zip(s("feedback_360__sentiment_positive"), fb_rows)
-    ]
-    df["kpi__360_sentiment_constructive_pct"] = [
-        safe_div(cons, total, 100.0)
-        for cons, total in zip(s("feedback_360__sentiment_constructive"), fb_rows)
-    ]
-    df["kpi__360_sentiment_mixed_pct"] = [
-        safe_div(mix, total, 100.0)
-        for mix, total in zip(s("feedback_360__sentiment_mixed"), fb_rows)
-    ]
+    # --- 2) Compute expected numeric score + expected rating ---
+    df["kpi__expected_score"] = df.apply(_score_row, axis=1)
+    df["kpi__expected_rating"] = df["kpi__expected_score"].apply(_level_to_rating)
 
-    # story point completion ratio
-    df["kpi__story_point_completion_ratio"] = [
-        safe_div(done, committed)
-        for done, committed in zip(
-            s("jira_metrics__story_points_completed"),
-            s("jira_metrics__story_points_committed")
-        )
-    ]
+    # --- 3) Bias detection by comparing manager rating vs expected rating ---
+    mgr_level = df["mgr_rating"].apply(_rating_to_level)
+    exp_level = df["kpi__expected_rating"].apply(_rating_to_level)
+    diff = mgr_level - exp_level
 
-    # defect escape rate
-    df["kpi__defect_escape_rate"] = [
-        safe_div(esc, rows)
-        for esc, rows in zip(
-            s("defects__escaped_to_prod"),
-            s("defects___rows")
-        )
-    ]
+    # bias exists if manager rating is ≥2 levels higher/lower than expected
+    df["bias__flag"] = (diff.abs() >= 2).astype(int)
 
-    # rto compliance rate
-    r = [
-        safe_div(in_office, required, 100.0)
-        for in_office, required in zip(
-            s("rto__in_office_days"), s("rto__required_days")
-        )
-    ]
-    df["kpi__rto_compliance_rate"] = np.clip(r, 0, 100)
+    def direction(d):
+        if d >= 2:
+            return "manager_higher"
+        if d <= -2:
+            return "manager_lower"
+        return "aligned"
 
-    # copilot accept ratio
-    df["kpi__copilot_accept_ratio"] = [
-        safe_div(acc, total)
-        for acc, total in zip(
-            s("github_metrics__copilot_suggestions_accepted"),
-            s("github_metrics__copilot_suggestions_total"),
-        )
-    ]
+    df["bias__direction"] = diff.apply(direction)
 
     return df
+
+
+
+
+# === Apply Expected Score and Bias Detection ===
+try:
+    from .scoring_rules import apply_scoring_rules
+    features_by_period_df = apply_scoring_rules(features_by_period_df, loaded)
+except Exception as e:
+    log.exception("Scoring/Bias rules failed: %s", e)
