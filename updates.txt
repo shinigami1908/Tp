@@ -1,294 +1,62 @@
-# src/features/scoring_rules.py
-
-"""
-Per-employee, per-period scoring & bias detection.
-
-Inputs:
-    - features_by_period_df: output of compute_kpis(...)[1]
-    - loaded: dict of original DataFrames (from run_etl()['loaded'])
-
-Adds to features_by_period_df:
-    * manager_evaluations__mgr_rating      (manager's rating from manager_evaluations.csv)
-    * kpi__expected_score                  (0–1 heuristic score)
-    * kpi__expected_rating                 (text rating derived from expected_score)
-    * bias__rating_comparison              (5-way comparison label)
-    * bias__lexicon_tags                   (list of heuristic bias tags, e.g. ["recency","affinity"])
-"""
-
-from typing import Dict, Any, List, Tuple
-import pandas as pd
-import numpy as np
-
-
-# canonical rating levels
-RATING_SCALE = {
-    "needs improvement": 1,
-    "inconsistently meets": 2,
-    "meets": 3,
-    "exceeds": 4,
-    "consistently exceeds": 5,
-}
-
-# simple keyword bias lexicon (inspired by the starter notebook)
+# Updated Bias Lexicon — keyword : category
 BIAS_LEXICON = {
-    "recency": ["recently", "lately", "last sprint", "this month"],
-    "affinity": ["gets along", "likeable", "culture fit"],
-    "style": ["quiet", "aggressive", "not outspoken", "communication style"],
-    "opinion_only": ["seems", "appears", "feels like"],
+    "recently": "recency",
+    "lately": "recency",
+    "last sprint": "recency",
+    "this month": "recency",
+    "gets along": "affinity",
+    "likeable": "affinity",
+    "culture fit": "affinity",
+    "quiet": "style",
+    "aggressive": "style",
+    "not outspoken": "style",
+    "communication style": "style",
+    "seems": "opinion_only",
+    "appears": "opinion_only",
+    "feels like": "opinion_only",
 }
 
-
-def _rating_to_level(rating: str) -> int:
-    if not isinstance(rating, str):
-        return 0
-    return RATING_SCALE.get(rating.strip().lower(), 0)
-
-
+# New expected rating thresholds
 def _level_to_rating(score: float) -> str:
-    """
-    Map numeric expected_score in [0, 1] to a textual rating.
-    Thresholds are heuristic and can be tuned later.
-    """
-    if score >= 0.80:
+    if score >= 0.85:
         return "Consistently Exceeds"
-    if score >= 0.60:
+    if score >= 0.65:
         return "Exceeds"
-    if score >= 0.40:
+    if score >= 0.45:   # tightened
         return "Meets"
-    if score >= 0.25:
+    if score >= 0.30:
         return "Inconsistently Meets"
     return "Needs Improvement"
 
 
-def _score_row(row: pd.Series) -> float:
-    """
-    Heuristic scoring per employee-period based on KPIs.
-
-    Uses (if present):
-      - kpi__velocity
-      - kpi__spillover_pct
-      - kpi__defect_density_per_100_sp
-      - kpi__360_sentiment_positive_pct
-      - kpi__copilot_accept_ratio
-      - kpi__rto_compliance_rate
-      - release_metrics__defect_rate_ppm
-
-    Total score capped at 1.0.
-    """
-
-    def v(name: str, default: float = 0.0) -> float:
-        val = row.get(name, default)
-        try:
-            if val is None or val == "" or (isinstance(val, float) and np.isnan(val)):
-                return default
-            return float(val)
-        except Exception:
-            return default
-
-    score = 0.0
-
-    # --- Delivery: spillover (lower better) & velocity (higher better)
-    spill = v("kpi__spillover_pct")
-    if spill <= 10:
-        score += 0.20
-    elif spill <= 25:
-        score += 0.10
-
-    velocity = v("kpi__velocity")
-    if velocity >= 50:
-        score += 0.20
-    elif velocity >= 20:
-        score += 0.10
-
-    # --- Quality: defect density (lower is better) ---
-    dd = v("kpi__defect_density_per_100_sp")
-    if dd <= 5:
-        score += 0.20
-    elif dd <= 10:
-        score += 0.10
-
-    # --- 360 Sentiment: positive % (higher is better) ---
-    pos = v("kpi__360_sentiment_positive_pct")
-    if pos >= 70:
-        score += 0.10
-    elif pos >= 50:
-        score += 0.05
-
-    # --- Copilot adoption (higher is better) ---
-    cop = v("kpi__copilot_accept_ratio")
-    if cop >= 0.50:
-        score += 0.10
-    elif cop >= 0.25:
-        score += 0.05
-
-    # --- RTO compliance (higher is better) ---
-    rto = v("kpi__rto_compliance_rate")
-    if rto >= 90:
-        score += 0.10
-    elif rto >= 75:
-        score += 0.05
-
-    # --- Release quality (if available) ---
-    ppm_raw = row.get("release_metrics__defect_rate_ppm", None)
-    if ppm_raw is not None and ppm_raw != "":
-        try:
-            ppm = float(ppm_raw)
-            if ppm <= 100:
-                score += 0.10
-            elif ppm <= 300:
-                score += 0.05
-        except Exception:
-            pass
-
-    return float(min(score, 1.0))
-
 
 def _bias_lexicon_tags(text: str) -> List[str]:
-    """
-    Scan the manager's text for bias-related keywords and return
-    a list of tag keys from BIAS_LEXICON that appear.
-    """
     if not isinstance(text, str):
         return []
     t = text.lower()
     hits: List[str] = []
-    for tag, keys in BIAS_LEXICON.items():
-        if any(k in t for k in keys):
-            hits.append(tag)
-    return hits
+    for kw, category in BIAS_LEXICON.items():
+        if kw in t:
+            hits.append(kw)  # return the actual biased term, not category
+    return sorted(set(hits))
 
 
-def apply_scoring_rules(
-    features_by_period_df: pd.DataFrame,
-    loaded: Dict[str, Any],
-) -> pd.DataFrame:
-    """
-    Attach manager rating, expected score/rating and 5-level bias comparison
-    to the per-period feature frame.
-    """
-    if features_by_period_df is None or features_by_period_df.empty:
-        return features_by_period_df
 
-    df = features_by_period_df.copy()
 
-    # --- 1) Bring in manager rating + lexicon tags from manager_evaluations.csv ---
-    mgr_df = None
-    if isinstance(loaded, dict):
-        mgr_df = loaded.get("manager_evaluations")
 
-    lexicon_col = "bias__lexicon_tags"
-    df[lexicon_col] = [[] for _ in range(len(df))]  # default: empty list
+# Delivery — reduced contribution
+if spill <= 10:
+    score += 0.15
+elif spill <= 25:
+    score += 0.07
 
-    if isinstance(mgr_df, pd.DataFrame) and not mgr_df.empty:
-        md = mgr_df.copy()
+if velocity >= 50:
+    score += 0.15
+elif velocity >= 20:
+    score += 0.07
 
-        # ensure period_half exists in manager_evaluations
-        if "period_half" not in md.columns:
-            if "period" in md.columns:
-                md["period_half"] = md["period"].astype(str)
-            else:
-                md["period_half"] = "NA"
-
-        # build a combined text field to search for bias (comment + bias_notes)
-        text_source_cols = []
-        if "manager_comment" in md.columns:
-            text_source_cols.append("manager_comment")
-        if "bias_notes" in md.columns:
-            text_source_cols.append("bias_notes")
-
-        if text_source_cols:
-            md["_bias_text"] = md[text_source_cols].astype(str).agg(" ".join, axis=1)
-        else:
-            md["_bias_text"] = ""
-
-        md["__lex_tags"] = md["_bias_text"].apply(_bias_lexicon_tags)
-
-        cols = [c for c in ["employee_id", "period_half", "rating", "__lex_tags"] if c in md.columns]
-        md = md[cols].dropna(subset=["employee_id"]).copy()
-
-        # group per employee+period (in case of multiple rows)
-        grouped = (
-            md.groupby(["employee_id", "period_half"], dropna=False)
-            .agg(
-                {
-                    "rating": "last",
-                    "__lex_tags": lambda x: sorted(
-                        {tag for tags in x for tag in (tags or [])}
-                    ),
-                }
-            )
-            .reset_index()
-        )
-
-        # rename rating to manager_evaluations__mgr_rating so it sits with other manager fields
-        grouped = grouped.rename(columns={"rating": "manager_evaluations__mgr_rating"})
-
-        df = df.merge(grouped, on=["employee_id", "period_half"], how="left")
-
-        # move lexicon tags into a proper column on df
-        if "__lex_tags" in df.columns:
-            df[lexicon_col] = df["__lex_tags"].apply(
-                lambda x: x if isinstance(x, list) else ([] if pd.isna(x) else [x])
-            )
-            df = df.drop(columns=["__lex_tags"], errors="ignore")
-    else:
-        # no manager evaluations – still create rating column for consistency
-        df["manager_evaluations__mgr_rating"] = ""
-
-    # --- 2) Compute expected numeric score + expected rating ---
-    df["kpi__expected_score"] = df.apply(_score_row, axis=1)
-    df["kpi__expected_rating"] = df["kpi__expected_score"].apply(_level_to_rating)
-
-    # --- 3) Five-level bias comparison between manager and expected rating ---
-
-    mgr_level = df["manager_evaluations__mgr_rating"].apply(_rating_to_level)
-    exp_level = df["kpi__expected_rating"].apply(_rating_to_level)
-    diff = mgr_level - exp_level  # >0 manager higher, <0 manager lower
-
-    def base_classification(d: int) -> str:
-        if d == 0:
-            return "aligned"
-        if d == 1:
-            return "manager_slightly_high"
-        if d == -1:
-            return "manager_slightly_low"
-        if d >= 2:
-            return "manager_very_high"
-        if d <= -2:
-            return "manager_very_low"
-        return "aligned"
-
-    base_classes = diff.apply(base_classification)
-
-    def adjusted_class(row) -> str:
-        d = int(row["_diff"] if "_diff" in row else 0)
-        base = row["_base"]
-        tags = row.get("bias__lexicon_tags") or []
-
-        # if aligned or no tags, keep base
-        if base == "aligned" or not tags:
-            return base
-
-        # if manager rated higher than expected and we see recency/affinity, treat as stronger upward bias
-        if d > 0 and any(t in tags for t in ["recency", "affinity"]):
-            if base == "manager_slightly_high":
-                return "manager_very_high"
-
-        # if manager rated lower than expected and we see style/opinion_only, treat as stronger downward bias
-        if d < 0 and any(t in tags for t in ["style", "opinion_only"]):
-            if base == "manager_slightly_low":
-                return "manager_very_low"
-
-        return base
-
-    tmp = pd.DataFrame({"_diff": diff, "_base": base_classes})
-    df["bias__rating_comparison"] = tmp.join(df[lexicon_col])\
-                                       .apply(adjusted_class, axis=1)
-
-    # clean up any helper columns if they leaked
-    if "_diff" in df.columns:
-        df = df.drop(columns=["_diff"], errors="ignore")
-    if "_base" in df.columns:
-        df = df.drop(columns=["_base"], errors="ignore")
-
-    return df
+# 360 Sentiment — reduced contribution
+if pos >= 70:
+    score += 0.07
+elif pos >= 50:
+    score += 0.03
