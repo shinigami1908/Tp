@@ -1,62 +1,208 @@
-# Updated Bias Lexicon — keyword : category
-BIAS_LEXICON = {
-    "recently": "recency",
-    "lately": "recency",
-    "last sprint": "recency",
-    "this month": "recency",
-    "gets along": "affinity",
-    "likeable": "affinity",
-    "culture fit": "affinity",
-    "quiet": "style",
-    "aggressive": "style",
-    "not outspoken": "style",
-    "communication style": "style",
-    "seems": "opinion_only",
-    "appears": "opinion_only",
-    "feels like": "opinion_only",
-}
+# src/llm/generator.py
 
-# New expected rating thresholds
-def _level_to_rating(score: float) -> str:
-    if score >= 0.85:
-        return "Consistently Exceeds"
-    if score >= 0.65:
-        return "Exceeds"
-    if score >= 0.45:   # tightened
-        return "Meets"
-    if score >= 0.30:
-        return "Inconsistently Meets"
-    return "Needs Improvement"
+"""
+LLM / reporting orchestration module.
+
+Right now this file focuses on building a per-manager, per-employee "report card"
+purely from ETL outputs (no GPT call yet).
+
+Inputs (from ETL / feature engineering):
+  - mockdata/employees.csv
+  - output/features_by_period.json
+  - output/features_combined.json
+
+Core functions:
+  - build_manager_reports(manager_id: str) -> list[dict]
+  - generate_manager_console_report()      # uses hard-coded manager_id "M100" for now
+
+Later, we can wire these report structures into TachyonChatManager to get
+natural language summaries for each employee.
+"""
+
+from pathlib import Path
+import json
+from typing import List, Dict, Any
+
+import pandas as pd
+import numpy as np
+
+from src.common.logger import get_logger
+
+log = get_logger("generator")
 
 
+def _json_safe(val: Any) -> Any:
+    """
+    Normalize numpy types / NaN to JSON-friendly primitives.
+    Leaves lists/dicts as-is.
+    """
+    # numpy scalar -> Python scalar
+    if isinstance(val, (np.generic,)):
+        val = val.item()
 
-def _bias_lexicon_tags(text: str) -> List[str]:
-    if not isinstance(text, str):
+    # for scalars, treat NaNs as None
+    try:
+        if isinstance(val, (float, int, str)) and pd.isna(val):
+            return None
+    except TypeError:
+        # pd.isna on list/dict raises; ignore
+        pass
+
+    return val
+
+
+def build_manager_reports(
+    manager_id: str,
+    base_dir: Path | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build report-card structures for all employees under the given manager_id.
+
+    For each employee, returns:
+      {
+        "employee_id": ...,
+        "name": ...,
+        "role": ...,
+        "org": ...,
+        "manager_id": ...,
+        "periods": [
+          # full rows from features_by_period.json (minus employee_id)
+          { <all period columns> },
+          ...
+        ],
+        "combined_extra": {
+          # all columns that exist only in features_combined.json
+          # and do not appear in features_by_period.json
+        }
+      }
+    """
+
+    if base_dir is None:
+        base_dir = Path(".")
+
+    mockdata_dir = base_dir / "mockdata"
+    output_dir = base_dir / "output"
+
+    employees_path = mockdata_dir / "employees.csv"
+    by_period_path = output_dir / "features_by_period.json"
+    combined_path = output_dir / "features_combined.json"
+
+    if not employees_path.exists():
+        log.error("employees.csv not found at %s", employees_path)
         return []
-    t = text.lower()
-    hits: List[str] = []
-    for kw, category in BIAS_LEXICON.items():
-        if kw in t:
-            hits.append(kw)  # return the actual biased term, not category
-    return sorted(set(hits))
+
+    if not by_period_path.exists():
+        log.error("features_by_period.json not found at %s", by_period_path)
+        return []
+
+    if not combined_path.exists():
+        log.error("features_combined.json not found at %s", combined_path)
+        return []
+
+    # Load core data
+    employees_df = pd.read_csv(employees_path)
+    by_period_df = pd.read_json(by_period_path)
+    combined_df = pd.read_json(combined_path)
+
+    # Filter employees under this manager
+    if "manager_id" not in employees_df.columns:
+        log.error("employees.csv must contain 'manager_id' column")
+        return []
+
+    team_df = employees_df[employees_df["manager_id"] == manager_id].copy()
+    if team_df.empty:
+        log.warning("No employees found under manager_id=%s", manager_id)
+        return []
+
+    team_emp_ids = team_df["employee_id"].tolist()
+
+    by_period_team = by_period_df[by_period_df["employee_id"].isin(team_emp_ids)].copy()
+    combined_team = combined_df[combined_df["employee_id"].isin(team_emp_ids)].copy()
+
+    # For periods: include EVERYTHING that exists in features_by_period.json
+    period_all_cols = list(by_period_df.columns)
+
+    # For combined: only include columns that are NOT present in the by_period frame
+    period_col_set = set(by_period_df.columns)
+    combined_all_cols = [c for c in combined_df.columns if c not in period_col_set]
+
+    # We already carry employee_id at the top level, so we can drop it from nested dicts
+    if "employee_id" in period_all_cols:
+        period_all_cols_no_emp = [c for c in period_all_cols if c != "employee_id"]
+    else:
+        period_all_cols_no_emp = period_all_cols
+
+    if "employee_id" in combined_all_cols:
+        combined_extra_cols = [c for c in combined_all_cols if c != "employee_id"]
+    else:
+        combined_extra_cols = combined_all_cols
+
+    report_cards: List[Dict[str, Any]] = []
+
+    for _, emp_row in team_df.iterrows():
+        emp_id = emp_row.get("employee_id")
+        name = emp_row.get("name")
+        role = emp_row.get("role")
+        org = emp_row.get("org")
+
+        # All periods for this employee
+        emp_period_rows = by_period_team[by_period_team["employee_id"] == emp_id].copy()
+
+        periods: List[Dict[str, Any]] = []
+        for _, prow in emp_period_rows.iterrows():
+            row_dict: Dict[str, Any] = {}
+            for col in period_all_cols_no_emp:
+                if col in prow.index:
+                    row_dict[col] = _json_safe(prow[col])
+            periods.append(row_dict)
+
+        # combined-level info (one row per employee_id), only extra columns
+        emp_combined = combined_team[combined_team["employee_id"] == emp_id].copy()
+        combined_extra: Dict[str, Any] = {}
+        if not emp_combined.empty:
+            crow = emp_combined.iloc[0]
+            for col in combined_extra_cols:
+                if col in crow.index:
+                    combined_extra[col] = _json_safe(crow[col])
+
+        report = {
+            "employee_id": emp_id,
+            "name": name,
+            "role": role,
+            "org": org,
+            "manager_id": manager_id,
+            "periods": periods,          # full per-period rows (minus employee_id)
+            "combined_extra": combined_extra,  # all combined-only fields
+        }
+
+        report_cards.append(report)
+
+    return report_cards
 
 
+def generate_manager_console_report() -> None:
+    """
+    Convenience function: build report-cards for a (currently hard-coded) manager_id
+    and print them to the console as JSON.
+
+    Later, the frontend will pass manager_id from the login/session.
+    """
+
+    # When frontend exists, this will come from the logged-in user context, e.g.:
+    #   manager_id = get_manager_id_from_frontend_session()
+    # For now, we use a fixed ID for demo:
+    manager_id = "M100"
+
+    reports = build_manager_reports(manager_id)
+
+    print("\n=== Manager Report Cards for manager_id =", manager_id, "===\n")
+    print(json.dumps(reports, indent=2, default=str))
+    print("\n=== End of Manager Report Cards ===\n")
 
 
-
-# Delivery — reduced contribution
-if spill <= 10:
-    score += 0.15
-elif spill <= 25:
-    score += 0.07
-
-if velocity >= 50:
-    score += 0.15
-elif velocity >= 20:
-    score += 0.07
-
-# 360 Sentiment — reduced contribution
-if pos >= 70:
-    score += 0.07
-elif pos >= 50:
-    score += 0.03
+if __name__ == "__main__":
+    # Allow running this module directly:
+    #   python -m src.llm.generator
+    # or:
+    #   python src/llm/generator.py
+    generate_manager_console_report()
