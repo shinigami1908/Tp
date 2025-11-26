@@ -1,530 +1,77 @@
-# src/llm/generator.py
+# src/llm/prompts.py
 
 """
-LLM / reporting orchestration module.
+Prompts for TachyonChatManager in HR Employee Insights workflow.
 
-Responsibilities:
-  - Build per-employee, per-manager report-card structures from ETL outputs.
-  - Upload full report_cards JSON to Tachyon file API (overwrite previous file).
-  - For a given manager_id, build the subset of report_cards and call GPT
-    (via TachyonChatManager) to get JSON insights — one section per employee.
-
-Inputs (from ETL / feature engineering):
-  - mockdata/employees.csv
-  - output/features_by_period.json
-  - output/features_combined.json
-
-Core functions:
-  - get_current_manager_id() -> str
-  - build_manager_reports(manager_id: str) -> list[dict]
-  - build_all_reports() -> list[dict]
-  - upload_all_report_cards() -> dict | None
-  - generate_manager_console_report(manager_id: str | None)
-  - generate_manager_gpt_insights(manager_id: str | None)
+These templates ensure:
+ - JSON-only structured output
+ - No extra prose
+ - Per-employee insight generation
+ - Bias comparison (manager rating vs expected score-derived rating)
 """
 
-from pathlib import Path
-import json
-from typing import List, Dict, Any, Optional
 
-import numpy as np
-import pandas as pd
-
-from src.common.logger import get_logger
-from .llm_generation import TachyonChatManager, TachyonFileManager
-
-log = get_logger("generator")
-
-
-# ------------------------ Manager ID helper ------------------------
-
-
-def get_current_manager_id() -> str:
-    """
-    Temporary helper: returns the current manager_id.
-    For now, this is hard-coded to 'M100' for local testing.
-
-    When frontend integration is ready, replace this implementation
-    to read the logged-in manager's ID from session / JWT / request.
-    """
-    return "M100"
-
-
-# ------------------------ Helpers ------------------------
-
-
-def _json_safe(val: Any) -> Any:
-    """
-    Normalize numpy types / NaN to JSON-friendly primitives.
-    Leaves lists/dicts as-is.
-    """
-    if isinstance(val, (np.generic,)):
-        val = val.item()
-
-    try:
-        if isinstance(val, (float, int, str)) and pd.isna(val):
-            return None
-    except TypeError:
-        # pd.isna on list/dict raises; ignore
-        pass
-
-    return val
-
-
-def _load_core_frames(base_dir: Optional[Path] = None):
-    """
-    Load employees.csv, features_by_period.json, features_combined.json.
-    Returns (employees_df, by_period_df, combined_df) or (None, None, None) on error.
-    """
-    if base_dir is None:
-        base_dir = Path(".")
-
-    mockdata_dir = base_dir / "mockdata"
-    output_dir = base_dir / "output"
-
-    employees_path = mockdata_dir / "employees.csv"
-    by_period_path = output_dir / "features_by_period.json"
-    combined_path = output_dir / "features_combined.json"
-
-    if not employees_path.exists():
-        log.error("employees.csv not found at %s", employees_path)
-        return None, None, None
-
-    if not by_period_path.exists():
-        log.error("features_by_period.json not found at %s", by_period_path)
-        return None, None, None
-
-    if not combined_path.exists():
-        log.error("features_combined.json not found at %s", combined_path)
-        return None, None, None
-
-    employees_df = pd.read_csv(employees_path)
-    by_period_df = pd.read_json(by_period_path)
-    combined_df = pd.read_json(combined_path)
-
-    return employees_df, by_period_df, combined_df
-
-
-# ------------------------ Report builders ------------------------
-
-
-def build_manager_reports(
-    manager_id: str,
-    base_dir: Optional[Path] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Build report-card structures for all employees under the given manager_id.
-
-    For each employee, returns:
-      {
-        "employee_id": ...,
-        "name": ...,
-        "role": ...,
-        "org": ...,
-        "manager_id": ...,
-        "periods": [
-          # full rows from features_by_period.json (minus employee_id)
-          { <all period columns> },
-          ...
-        ],
-        "combined_extra": {
-          # all columns that exist only in features_combined.json
-          # and do not appear in features_by_period.json
-        }
-      }
-    """
-    employees_df, by_period_df, combined_df = _load_core_frames(base_dir)
-    if employees_df is None:
-        return []
-
-    if "manager_id" not in employees_df.columns:
-        log.error("employees.csv must contain 'manager_id' column")
-        return []
-
-    team_df = employees_df[employees_df["manager_id"] == manager_id].copy()
-    if team_df.empty:
-        log.warning("No employees found under manager_id=%s", manager_id)
-        return []
-
-    team_emp_ids = team_df["employee_id"].tolist()
-
-    by_period_team = by_period_df[by_period_df["employee_id"].isin(team_emp_ids)].copy()
-    combined_team = combined_df[combined_df["employee_id"].isin(team_emp_ids)].copy()
-
-    period_all_cols = list(by_period_df.columns)
-    period_col_set = set(by_period_df.columns)
-    combined_all_cols = [c for c in combined_df.columns if c not in period_col_set]
-
-    if "employee_id" in period_all_cols:
-        period_all_cols_no_emp = [c for c in period_all_cols if c != "employee_id"]
-    else:
-        period_all_cols_no_emp = period_all_cols
-
-    if "employee_id" in combined_all_cols:
-        combined_extra_cols = [c for c in combined_all_cols if c != "employee_id"]
-    else:
-        combined_extra_cols = combined_all_cols
-
-    report_cards: List[Dict[str, Any]] = []
-
-    for _, emp_row in team_df.iterrows():
-        emp_id = emp_row.get("employee_id")
-        name = emp_row.get("name")
-        role = emp_row.get("role")
-        org = emp_row.get("org")
-
-        emp_period_rows = by_period_team[by_period_team["employee_id"] == emp_id].copy()
-
-        periods: List[Dict[str, Any]] = []
-        for _, prow in emp_period_rows.iterrows():
-            row_dict: Dict[str, Any] = {}
-            for col in period_all_cols_no_emp:
-                if col in prow.index:
-                    row_dict[col] = _json_safe(prow[col])
-            periods.append(row_dict)
-
-        emp_combined = combined_team[combined_team["employee_id"] == emp_id].copy()
-        combined_extra: Dict[str, Any] = {}
-        if not emp_combined.empty:
-            crow = emp_combined.iloc[0]
-            for col in combined_extra_cols:
-                if col in crow.index:
-                    combined_extra[col] = _json_safe(crow[col])
-
-        report = {
-            "employee_id": emp_id,
-            "name": name,
-            "role": role,
-            "org": org,
-            "manager_id": manager_id,
-            "periods": periods,
-            "combined_extra": combined_extra,
-        }
-
-        report_cards.append(report)
-
-    log.info(
-        "Built %d report cards for manager_id=%s",
-        len(report_cards),
-        manager_id,
-    )
-    return report_cards
-
-
-def build_all_reports(base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """
-    Build report-cards for ALL employees in the system (no manager filter).
-
-    Structure is the same as build_manager_reports, but includes every employee,
-    using each employee's own manager_id from employees.csv.
-    """
-    employees_df, by_period_df, combined_df = _load_core_frames(base_dir)
-    if employees_df is None:
-        return []
-
-    if "employee_id" not in employees_df.columns:
-        log.error("employees.csv must contain 'employee_id' column")
-        return []
-
-    period_all_cols = list(by_period_df.columns)
-    period_col_set = set(by_period_df.columns)
-    combined_all_cols = [c for c in combined_df.columns if c not in period_col_set]
-
-    if "employee_id" in period_all_cols:
-        period_all_cols_no_emp = [c for c in period_all_cols if c != "employee_id"]
-    else:
-        period_all_cols_no_emp = period_all_cols
-
-    if "employee_id" in combined_all_cols:
-        combined_extra_cols = [c for c in combined_all_cols if c != "employee_id"]
-    else:
-        combined_extra_cols = combined_all_cols
-
-    report_cards: List[Dict[str, Any]] = []
-
-    for _, emp_row in employees_df.iterrows():
-        emp_id = emp_row.get("employee_id")
-        name = emp_row.get("name")
-        role = emp_row.get("role")
-        org = emp_row.get("org")
-        manager_id = emp_row.get("manager_id")
-
-        emp_period_rows = by_period_df[by_period_df["employee_id"] == emp_id].copy()
-        emp_combined = combined_df[combined_df["employee_id"] == emp_id].copy()
-
-        periods: List[Dict[str, Any]] = []
-        for _, prow in emp_period_rows.iterrows():
-            row_dict: Dict[str, Any] = {}
-            for col in period_all_cols_no_emp:
-                if col in prow.index:
-                    row_dict[col] = _json_safe(prow[col])
-            periods.append(row_dict)
-
-        combined_extra: Dict[str, Any] = {}
-        if not emp_combined.empty:
-            crow = emp_combined.iloc[0]
-            for col in combined_extra_cols:
-                if col in crow.index:
-                    combined_extra[col] = _json_safe(crow[col])
-
-        report = {
-            "employee_id": emp_id,
-            "name": name,
-            "role": role,
-            "org": org,
-            "manager_id": manager_id,
-            "periods": periods,
-            "combined_extra": combined_extra,
-        }
-        report_cards.append(report)
-
-    log.info("Built %d total report cards for all employees", len(report_cards))
-    return report_cards
-
-
-# ------------------------ Upload to Tachyon (Option B overwrite) ------------------------
-
-
-def upload_all_report_cards(base_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """
-    Build report cards for all employees and upload as a single JSON file
-    to Tachyon via TachyonFileManager.upload_file_s3.
-
-    Overwrite strategy (Option B):
-      - If a previous Tachyon file_id is stored locally, attempt to delete
-        that file via delete_file_from_s3 BEFORE uploading the new one.
-
-    Side effects:
-      - Writes report_cards_all.json into output/
-      - Writes last Tachyon file_id into output/tachyon_last_file_id.txt
-
-    Returns the Tachyon API response (or None on error).
-    """
-    if base_dir is None:
-        base_dir = Path(".")
-
-    output_dir = base_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    last_file_id_path = output_dir / "tachyon_last_file_id.txt"
-
-    log.info("Building report_cards for all employees...")
-    all_reports = build_all_reports(base_dir=base_dir)
-    if not all_reports:
-        log.error("No report cards built; aborting upload.")
-        return None
-
-    report_path = output_dir / "report_cards_all.json"
-    try:
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(all_reports, f, indent=2, default=str)
-        log.info("Wrote report_cards_all.json to %s", report_path)
-    except Exception as e:
-        log.exception("Failed to write report_cards_all.json: %s", e)
-        return None
-
-    tfm = TachyonFileManager()
-
-    if last_file_id_path.exists():
-        try:
-            old_file_id = last_file_id_path.read_text(encoding="utf-8").strip()
-        except Exception:
-            old_file_id = ""
-
-        if old_file_id:
-            log.info("Found previous Tachyon file_id=%s, attempting to delete...", old_file_id)
-            try:
-                delete_resp = tfm.delete_file_from_s3(old_file_id)
-                log.info("Delete response for old file_id=%s: %s", old_file_id, delete_resp)
-            except Exception as e:
-                log.warning("Failed to delete previous Tachyon file_id=%s: %s", old_file_id, e)
-        else:
-            log.info("tachyon_last_file_id.txt exists but is empty.")
-
-    try:
-        log.info("Uploading report_cards_all.json to Tachyon file API...")
-        response_obj = tfm.upload_file_s3(str(report_path))
-        log.info("Upload response from Tachyon: %s", response_obj)
-
-        new_file_id = None
-        try:
-            new_file_id = response_obj.get("id")
-        except Exception:
-            new_file_id = None
-
-        if new_file_id:
-            log.info("Uploaded new Tachyon file_id: %s", new_file_id)
-            try:
-                last_file_id_path.write_text(new_file_id, encoding="utf-8")
-                log.info("Stored latest Tachyon file_id in %s", last_file_id_path)
-            except Exception as e:
-                log.warning("Could not write tachyon_last_file_id.txt: %s", e)
-        else:
-            log.warning("Could not find 'id' field in upload response.")
-
-        return response_obj
-
-    except Exception as e:
-        log.exception("Failed to upload report_cards_all.json: %s", e)
-        return None
-
-
-# ------------------------ Debug console report ------------------------
-
-
-def generate_manager_console_report(manager_id: Optional[str] = None) -> None:
-    """
-    Build report-cards for a manager_id and log a JSON snapshot (no GPT).
-    If manager_id is None, uses get_current_manager_id().
-    """
-    if manager_id is None:
-        manager_id = get_current_manager_id()
-
-    log.info("Generating console report for manager_id=%s", manager_id)
-    reports = build_manager_reports(manager_id)
-
-    try:
-        snippet = json.dumps(reports, indent=2, default=str)[:2000]
-        log.info("Manager %s report_cards sample:\n%s", manager_id, snippet)
-    except Exception:
-        log.info("Manager %s report_cards (length=%d rows)", manager_id, len(reports))
-
-
-# ------------------------ GPT Insights via TachyonChatManager ------------------------
-
-
-def _strip_code_fences(content: str) -> str:
-    """
-    Strip ```json ... ``` or ``` ... ``` fences from a model response,
-    returning only the inner JSON text.
-    """
-    cleaned = content.strip()
-
-    if cleaned.startswith("```"):
-        # Remove starting ```
-        cleaned = cleaned[3:].lstrip()
-        # Optional starting language tag
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].lstrip()
-        # Remove trailing ``` if present
-        fence_pos = cleaned.rfind("```")
-        if fence_pos != -1:
-            cleaned = cleaned[:fence_pos].strip()
-
-    return cleaned
-
-
-def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
-    """
-    Build structured report_cards for a given manager and call TachyonChatManager.chat_complete
-    to get JSON insights: one section per employee.
-
-    IMPORTANT (Option B):
-      - Does NOT send the full report_cards JSON in the prompt anymore.
-      - Instead, sends only manager_id and the list of employee_ids.
-      - The Tachyon backend is assumed to have access to the uploaded report_cards_all.json.
-
-    If manager_id is None, uses get_current_manager_id().
-
-    Saves:
-      - Parsed JSON to output/manager_{manager_id}_insights.json
-      - Raw text to output/manager_{manager_id}_insights_raw.txt if JSON parsing fails
-
-    Returns:
-      - Parsed JSON (list[dict]) on success
-      - {"status": "error", ...} or {"status": "ok_raw", "raw": "..."} on failure.
-    """
-    if manager_id is None:
-        manager_id = get_current_manager_id()
-
-    log.info("Generating GPT insights for manager_id=%s", manager_id)
-
-    base_dir = Path(".")
-    output_dir = base_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    manager_reports = build_manager_reports(manager_id)
-    if not manager_reports:
-        log.error("No report cards found for manager_id=%s", manager_id)
-        return {"status": "error", "detail": "No report cards for manager"}
-
-    log.info("Report cards built for GPT input: %d employees", len(manager_reports))
-
-    # Only pass employee_ids (small payload) instead of full JSON
-    employee_ids = [r.get("employee_id") for r in manager_reports if r.get("employee_id")]
-    employee_ids_json = json.dumps(employee_ids)
-
-    from .prompts import MANAGER_INSIGHTS_SYSTEM_PROMPT, MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE
-
-    tcm = TachyonChatManager()
-
-    system_msg = {
-        "role": "system",
-        "content": MANAGER_INSIGHTS_SYSTEM_PROMPT,
-    }
-
-    user_content = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
-        manager_id=manager_id,
-        employee_ids=employee_ids_json,
-    )
-
-    user_msg = {
-        "role": "user",
-        "content": user_content,
-    }
-
-    try:
-        log.info("Calling TachyonChatManager.chat_complete for manager_id=%s", manager_id)
-        response = tcm.chat_complete(messages=[system_msg, user_msg])
-
-        if isinstance(response, dict) and response.get("status") == "error":
-            log.error("chat_complete returned error: %s", response)
-            return response
-
-        try:
-            content = response.choices[0].message.content
-        except Exception as e:
-            log.error("Unexpected LLM response shape: %s", e)
-            return {"status": "error", "detail": "Unexpected LLM response shape"}
-
-        log.info("Raw LLM content length: %d", len(content) if content else 0)
-
-        cleaned = _strip_code_fences(content or "")
-        log.info("Cleaned LLM content length: %d", len(cleaned))
-
-        insights_path = output_dir / f"manager_{manager_id}_insights.json"
-        raw_path = output_dir / f"manager_{manager_id}_insights_raw.txt"
-
-        try:
-            insights = json.loads(cleaned)
-            with open(insights_path, "w", encoding="utf-8") as f:
-                json.dump(insights, f, indent=2)
-            log.info("Saved insights JSON to %s", insights_path)
-            return insights
-        except json.JSONDecodeError as e:
-            log.warning("Failed to parse LLM content as JSON: %s", e)
-            with open(raw_path, "w", encoding="utf-8") as f:
-                f.write(content or "")
-            log.info("Saved raw LLM content to %s", raw_path)
-            return {"status": "ok_raw", "raw": content}
-
-    except Exception as e:
-        log.exception("Error during GPT insight generation: %s", e)
-        return {"status": "error", "detail": str(e)}
-
-
-# ------------------------ Main (manual testing) ------------------------
-
-
-if __name__ == "__main__":
-    # Manual test flow, using the current default manager ID helper.
-    mgr_id = get_current_manager_id()
-
-    log.info("Step 1: Uploading all report cards to Tachyon...")
-    upload_all_report_cards()
-
-    log.info("Step 2: Generating console report for manager_id=%s (no GPT)...", mgr_id)
-    generate_manager_console_report(manager_id=mgr_id)
-
-    log.info("Step 3: Generating GPT insights for manager_id=%s...", mgr_id)
-    _ = generate_manager_gpt_insights(manager_id=mgr_id)
+MANAGER_INSIGHTS_SYSTEM_PROMPT = (
+    "You are an HR performance and fairness evaluation assistant for engineering teams. "
+    "You have access to detailed performance data (KPIs, defects, feedback, manager ratings, "
+    "IDP goals, etc.) for employees via the HR/Tachyon system. "
+    "You will be given a manager ID and the list of that manager's direct-report employee IDs. "
+    "Using only the data available in the system for those employees, you must:\n"
+    "- Summarize performance for each employee.\n"
+    "- Compare the manager's rating to an expected rating implied by the data.\n"
+    "- Identify potential bias (too generous or too harsh) based on that comparison.\n"
+    "- Highlight risk signals and provide development recommendations.\n\n"
+    "You must be objective, neutral, and data-driven. "
+    "Do not hallucinate details that could not be inferred from the underlying data. "
+    "Your final answer must be valid JSON only, with no extra commentary."
+)
+
+
+MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
+    "Manager ID: {manager_id}\n\n"
+    "Here is the list of employee IDs for this manager's direct reports:\n"
+    "{employee_ids}\n\n"
+    "The detailed performance report data for these employees is available to you "
+    "inside the HR/Tachyon system (for example, via an uploaded report file or vector store). "
+    "Use that underlying data to build your analysis.\n\n"
+    "----------------------------------------------\n\n"
+    "### REQUIRED OUTPUT FORMAT ###\n\n"
+    "Respond ONLY with a JSON array, where each element has this structure:\n\n"
+    "[\n"
+    "  {\n"
+    "    \"employee_id\": string,\n"
+    "    \"name\": string | null,\n"
+    "    \"period_summaries\": [\n"
+    "      {\n"
+    "        \"period_half\": string | null,\n"
+    "        \"overall_highlights\": string,\n"
+    "        \"kpi_summary\": string\n"
+    "      }\n"
+    "    ],\n"
+    "    \"bias_assessment\": {\n"
+    "      \"manager_rating\": string | null,\n"
+    "      \"expected_rating\": string | null,\n"
+    "      \"comparison\": string | null\n"
+    "      // Allowed comparison values:\n"
+    "      // \"aligned\" |\n"
+    "      // \"manager_slightly_high\" |\n"
+    "      // \"manager_very_high\" |\n"
+    "      // \"manager_slightly_low\" |\n"
+    "      // \"manager_very_low\" |\n"
+    "      // or null if not enough data.\n"
+    "    },\n"
+    "    \"risk_signals\": [string],\n"
+    "    \"development_recommendations\": [string]\n"
+    "  }\n"
+    "]\n\n"
+    "----------------------------------------------\n\n"
+    "Hard Requirements:\n"
+    "- Output MUST be valid JSON — no text before or after the JSON.\n"
+    "- If a field is not available, use null or an empty list as appropriate.\n"
+    "- Do NOT invent roles, metrics, or ratings beyond what can be inferred from the data.\n"
+    "- If multiple half-year periods (H1/H2) exist, analyze each separately in "
+    "period_summaries and then implicitly reflect that in your bias and recommendations.\n"
+    "- Focus on actionable, constructive recommendations for the manager.\n\n"
+    "----------------------------------------------\n"
+    "Now produce the insights in exactly the JSON format described above."
+)
