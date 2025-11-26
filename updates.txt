@@ -419,6 +419,11 @@ def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
     Build structured report_cards for a given manager and call TachyonChatManager.chat_complete
     to get JSON insights: one section per employee.
 
+    IMPORTANT (Option B):
+      - Does NOT send the full report_cards JSON in the prompt anymore.
+      - Instead, sends only manager_id and the list of employee_ids.
+      - The Tachyon backend is assumed to have access to the uploaded report_cards_all.json.
+
     If manager_id is None, uses get_current_manager_id().
 
     Saves:
@@ -445,6 +450,10 @@ def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
 
     log.info("Report cards built for GPT input: %d employees", len(manager_reports))
 
+    # Only pass employee_ids (small payload) instead of full JSON
+    employee_ids = [r.get("employee_id") for r in manager_reports if r.get("employee_id")]
+    employee_ids_json = json.dumps(employee_ids)
+
     from .prompts import MANAGER_INSIGHTS_SYSTEM_PROMPT, MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE
 
     tcm = TachyonChatManager()
@@ -456,7 +465,7 @@ def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
 
     user_content = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
         manager_id=manager_id,
-        report_cards_json=json.dumps(manager_reports, default=str),
+        employee_ids=employee_ids_json,
     )
 
     user_msg = {
