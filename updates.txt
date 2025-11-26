@@ -15,11 +15,12 @@ Inputs (from ETL / feature engineering):
   - output/features_combined.json
 
 Core functions:
+  - get_current_manager_id() -> str
   - build_manager_reports(manager_id: str) -> list[dict]
   - build_all_reports() -> list[dict]
-  - upload_all_report_cards() -> dict | None   # logs + prints file_id
-  - generate_manager_console_report(manager_id)  # debug: prints raw report_cards
-  - generate_manager_gpt_insights(manager_id)    # calls GPT, saves JSON in output/
+  - upload_all_report_cards() -> dict | None
+  - generate_manager_console_report(manager_id: str | None)
+  - generate_manager_gpt_insights(manager_id: str | None)
 """
 
 from pathlib import Path
@@ -35,6 +36,20 @@ from .llm_generation import TachyonChatManager, TachyonFileManager
 log = get_logger("generator")
 
 
+# ------------------------ Manager ID helper ------------------------
+
+
+def get_current_manager_id() -> str:
+    """
+    Temporary helper: returns the current manager_id.
+    For now, this is hard-coded to 'M100' for local testing.
+
+    When frontend integration is ready, replace this implementation
+    to read the logged-in manager's ID from session / JWT / request.
+    """
+    return "M100"
+
+
 # ------------------------ Helpers ------------------------
 
 
@@ -43,11 +58,9 @@ def _json_safe(val: Any) -> Any:
     Normalize numpy types / NaN to JSON-friendly primitives.
     Leaves lists/dicts as-is.
     """
-    # numpy scalar -> Python scalar
     if isinstance(val, (np.generic,)):
         val = val.item()
 
-    # for scalars, treat NaNs as None
     try:
         if isinstance(val, (float, int, str)) and pd.isna(val):
             return None
@@ -124,7 +137,6 @@ def build_manager_reports(
     if employees_df is None:
         return []
 
-    # Filter employees under this manager
     if "manager_id" not in employees_df.columns:
         log.error("employees.csv must contain 'manager_id' column")
         return []
@@ -139,14 +151,10 @@ def build_manager_reports(
     by_period_team = by_period_df[by_period_df["employee_id"].isin(team_emp_ids)].copy()
     combined_team = combined_df[combined_df["employee_id"].isin(team_emp_ids)].copy()
 
-    # For periods: include EVERYTHING that exists in features_by_period.json
     period_all_cols = list(by_period_df.columns)
-
-    # For combined: only include columns that are NOT present in the by_period frame
     period_col_set = set(by_period_df.columns)
     combined_all_cols = [c for c in combined_df.columns if c not in period_col_set]
 
-    # We already carry employee_id at the top level, so we can drop it from nested dicts
     if "employee_id" in period_all_cols:
         period_all_cols_no_emp = [c for c in period_all_cols if c != "employee_id"]
     else:
@@ -165,7 +173,6 @@ def build_manager_reports(
         role = emp_row.get("role")
         org = emp_row.get("org")
 
-        # All periods for this employee
         emp_period_rows = by_period_team[by_period_team["employee_id"] == emp_id].copy()
 
         periods: List[Dict[str, Any]] = []
@@ -176,7 +183,6 @@ def build_manager_reports(
                     row_dict[col] = _json_safe(prow[col])
             periods.append(row_dict)
 
-        # combined-level info (one row per employee_id), only extra columns
         emp_combined = combined_team[combined_team["employee_id"] == emp_id].copy()
         combined_extra: Dict[str, Any] = {}
         if not emp_combined.empty:
@@ -191,8 +197,8 @@ def build_manager_reports(
             "role": role,
             "org": org,
             "manager_id": manager_id,
-            "periods": periods,             # full per-period rows (minus employee_id)
-            "combined_extra": combined_extra,  # all combined-only fields
+            "periods": periods,
+            "combined_extra": combined_extra,
         }
 
         report_cards.append(report)
@@ -220,11 +226,8 @@ def build_all_reports(base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
         log.error("employees.csv must contain 'employee_id' column")
         return []
 
-    # For periods: include EVERYTHING that exists in features_by_period.json
     period_all_cols = list(by_period_df.columns)
     period_col_set = set(by_period_df.columns)
-
-    # For combined: only include columns that are NOT present in the by_period frame
     combined_all_cols = [c for c in combined_df.columns if c not in period_col_set]
 
     if "employee_id" in period_all_cols:
@@ -303,34 +306,25 @@ def upload_all_report_cards(base_dir: Optional[Path] = None) -> Optional[Dict[st
     output_dir = base_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # File to track the latest uploaded Tachyon file_id
     last_file_id_path = output_dir / "tachyon_last_file_id.txt"
 
-    # 1) Build all reports
     log.info("Building report_cards for all employees...")
-    print("Building report_cards for all employees...")
     all_reports = build_all_reports(base_dir=base_dir)
     if not all_reports:
         log.error("No report cards built; aborting upload.")
-        print("upload_all_report_cards: no report cards built; aborting.")
         return None
 
-    # 2) Save to JSON file
     report_path = output_dir / "report_cards_all.json"
     try:
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(all_reports, f, indent=2, default=str)
         log.info("Wrote report_cards_all.json to %s", report_path)
-        print(f"Report cards JSON written to: {report_path}")
     except Exception as e:
         log.exception("Failed to write report_cards_all.json: %s", e)
-        print(f"Error writing report_cards_all.json: {e}")
         return None
 
-    # 3) Create TachyonFileManager
     tfm = TachyonFileManager()
 
-    # 4) If we have a previous file_id, try to delete that file first (Option B)
     if last_file_id_path.exists():
         try:
             old_file_id = last_file_id_path.read_text(encoding="utf-8").strip()
@@ -339,29 +333,19 @@ def upload_all_report_cards(base_dir: Optional[Path] = None) -> Optional[Dict[st
 
         if old_file_id:
             log.info("Found previous Tachyon file_id=%s, attempting to delete...", old_file_id)
-            print(f"Found previous Tachyon file_id={old_file_id}, attempting to delete...")
-
             try:
                 delete_resp = tfm.delete_file_from_s3(old_file_id)
                 log.info("Delete response for old file_id=%s: %s", old_file_id, delete_resp)
-                print(f"Delete response for old file_id={old_file_id}: {delete_resp}")
             except Exception as e:
                 log.warning("Failed to delete previous Tachyon file_id=%s: %s", old_file_id, e)
-                print(f"Warning: failed to delete previous Tachyon file_id={old_file_id}: {e}")
         else:
             log.info("tachyon_last_file_id.txt exists but is empty.")
-            print("tachyon_last_file_id.txt exists but is empty.")
 
-    # 5) Upload via TachyonFileManager
     try:
         log.info("Uploading report_cards_all.json to Tachyon file API...")
-        print("Uploading report_cards_all.json to Tachyon file API...")
         response_obj = tfm.upload_file_s3(str(report_path))
-
         log.info("Upload response from Tachyon: %s", response_obj)
-        print(f"Upload response: {response_obj}")
 
-        # Extract new file_id
         new_file_id = None
         try:
             new_file_id = response_obj.get("id")
@@ -370,81 +354,97 @@ def upload_all_report_cards(base_dir: Optional[Path] = None) -> Optional[Dict[st
 
         if new_file_id:
             log.info("Uploaded new Tachyon file_id: %s", new_file_id)
-            print(f"New Tachyon file_id: {new_file_id}")
-
-            # Persist this ID locally so we can delete it next time
             try:
                 last_file_id_path.write_text(new_file_id, encoding="utf-8")
                 log.info("Stored latest Tachyon file_id in %s", last_file_id_path)
-                print(f"Stored latest Tachyon file_id in {last_file_id_path}")
             except Exception as e:
                 log.warning("Could not write tachyon_last_file_id.txt: %s", e)
-                print(f"Warning: could not write tachyon_last_file_id.txt: {e}")
         else:
             log.warning("Could not find 'id' field in upload response.")
-            print("Warning: Could not find 'id' field in upload response.")
 
         return response_obj
 
     except Exception as e:
         log.exception("Failed to upload report_cards_all.json: %s", e)
-        print(f"Error uploading report_cards_all.json: {e}")
         return None
 
 
 # ------------------------ Debug console report ------------------------
 
 
-def generate_manager_console_report(manager_id: str = "M100") -> None:
+def generate_manager_console_report(manager_id: Optional[str] = None) -> None:
     """
-    Convenience function: build report-cards for a manager_id and print them
-    to the console as JSON (no GPT).
+    Build report-cards for a manager_id and log a JSON snapshot (no GPT).
+    If manager_id is None, uses get_current_manager_id().
     """
-    # NOTE: When frontend is ready, manager_id will come from session:
-    #   manager_id = get_manager_id_from_frontend_session()
-    # For now: default "M100"
+    if manager_id is None:
+        manager_id = get_current_manager_id()
+
     log.info("Generating console report for manager_id=%s", manager_id)
     reports = build_manager_reports(manager_id)
 
-    print(f"\n=== Manager Report Cards for manager_id = {manager_id} ===\n")
-    print(json.dumps(reports, indent=2, default=str))
-    print("\n=== End of Manager Report Cards ===\n")
+    try:
+        snippet = json.dumps(reports, indent=2, default=str)[:2000]
+        log.info("Manager %s report_cards sample:\n%s", manager_id, snippet)
+    except Exception:
+        log.info("Manager %s report_cards (length=%d rows)", manager_id, len(reports))
 
 
 # ------------------------ GPT Insights via TachyonChatManager ------------------------
 
 
-def generate_manager_gpt_insights(manager_id: str = "M100") -> Any:
+def _strip_code_fences(content: str) -> str:
+    """
+    Strip ```json ... ``` or ``` ... ``` fences from a model response,
+    returning only the inner JSON text.
+    """
+    cleaned = content.strip()
+
+    if cleaned.startswith("```"):
+        # Remove starting ```
+        cleaned = cleaned[3:].lstrip()
+        # Optional starting language tag
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].lstrip()
+        # Remove trailing ``` if present
+        fence_pos = cleaned.rfind("```")
+        if fence_pos != -1:
+            cleaned = cleaned[:fence_pos].strip()
+
+    return cleaned
+
+
+def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
     """
     Build structured report_cards for a given manager and call TachyonChatManager.chat_complete
     to get JSON insights: one section per employee.
 
-    Also saves:
-      - Parsed JSON insights to output/manager_{manager_id}_insights.json (if valid JSON)
-      - Raw LLM content to output/manager_{manager_id}_insights_raw.txt (if JSON parse fails)
+    If manager_id is None, uses get_current_manager_id().
+
+    Saves:
+      - Parsed JSON to output/manager_{manager_id}_insights.json
+      - Raw text to output/manager_{manager_id}_insights_raw.txt if JSON parsing fails
 
     Returns:
       - Parsed JSON (list[dict]) on success
       - {"status": "error", ...} or {"status": "ok_raw", "raw": "..."} on failure.
     """
+    if manager_id is None:
+        manager_id = get_current_manager_id()
+
     log.info("Generating GPT insights for manager_id=%s", manager_id)
-    print(f"Generating GPT insights for manager_id={manager_id}...")
 
     base_dir = Path(".")
     output_dir = base_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Build structured data for this manager
     manager_reports = build_manager_reports(manager_id)
     if not manager_reports:
         log.error("No report cards found for manager_id=%s", manager_id)
-        print(f"No report cards found for manager_id={manager_id}")
         return {"status": "error", "detail": "No report cards for manager"}
 
-    log.info("Built %d report cards for GPT input (manager_id=%s)", len(manager_reports), manager_id)
-    print(f"Built {len(manager_reports)} report cards for GPT input.")
+    log.info("Report cards built for GPT input: %d employees", len(manager_reports))
 
-    # 2) Prepare TachyonChatManager and messages (prompts now come from prompts.py)
     from .prompts import MANAGER_INSIGHTS_SYSTEM_PROMPT, MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE
 
     tcm = TachyonChatManager()
@@ -464,56 +464,43 @@ def generate_manager_gpt_insights(manager_id: str = "M100") -> Any:
         "content": user_content,
     }
 
-    # 3) Call GPT via TachyonChatManager
     try:
         log.info("Calling TachyonChatManager.chat_complete for manager_id=%s", manager_id)
-        print("Calling TachyonChatManager.chat_complete...")
         response = tcm.chat_complete(messages=[system_msg, user_msg])
 
         if isinstance(response, dict) and response.get("status") == "error":
             log.error("chat_complete returned error: %s", response)
-            print(f"chat_complete error: {response}")
             return response
 
-        # Extract content (non-streaming)
         try:
             content = response.choices[0].message.content
         except Exception as e:
-            log.exception("Unexpected LLM response shape: %s", e)
-            print(f"Unexpected LLM response shape: {e}")
+            log.error("Unexpected LLM response shape: %s", e)
             return {"status": "error", "detail": "Unexpected LLM response shape"}
 
-        log.info("Raw LLM content (first 200 chars): %.200s", content)
-        print("Raw LLM content (first 200 chars):")
-        print(content[:200] + ("..." if len(content) > 200 else ""))
+        log.info("Raw LLM content length: %d", len(content) if content else 0)
 
-        # 4) Try to parse JSON for direct frontend consumption
+        cleaned = _strip_code_fences(content or "")
+        log.info("Cleaned LLM content length: %d", len(cleaned))
+
         insights_path = output_dir / f"manager_{manager_id}_insights.json"
         raw_path = output_dir / f"manager_{manager_id}_insights_raw.txt"
 
         try:
-            insights = json.loads(content)
-            log.info("Successfully parsed LLM JSON insights for manager_id=%s", manager_id)
-            print(f"Successfully parsed LLM JSON insights. Saving to {insights_path}")
-
+            insights = json.loads(cleaned)
             with open(insights_path, "w", encoding="utf-8") as f:
-                json.dump(insights, f, indent=2, default=str)
-
+                json.dump(insights, f, indent=2)
+            log.info("Saved insights JSON to %s", insights_path)
             return insights
         except json.JSONDecodeError as e:
             log.warning("Failed to parse LLM content as JSON: %s", e)
-            print(f"Failed to parse LLM content as JSON: {e}")
-            print(f"Saving raw LLM content to {raw_path}")
-
             with open(raw_path, "w", encoding="utf-8") as f:
-                f.write(content)
-
-            # Return raw so caller/front-end can still inspect
+                f.write(content or "")
+            log.info("Saved raw LLM content to %s", raw_path)
             return {"status": "ok_raw", "raw": content}
 
     except Exception as e:
         log.exception("Error during GPT insight generation: %s", e)
-        print(f"Error during GPT insight generation: {e}")
         return {"status": "error", "detail": str(e)}
 
 
@@ -521,85 +508,14 @@ def generate_manager_gpt_insights(manager_id: str = "M100") -> Any:
 
 
 if __name__ == "__main__":
-    # Manual debug steps:
-    # 1) Upload all report cards once (offline step)
-    print("Step 1: Uploading all report cards to Tachyon...")
+    # Manual test flow, using the current default manager ID helper.
+    mgr_id = get_current_manager_id()
+
+    log.info("Step 1: Uploading all report cards to Tachyon...")
     upload_all_report_cards()
 
-    # 2) Generate console report for manager M100 (no GPT)
-    print("\nStep 2: Console report for manager M100 (no GPT)...")
-    generate_manager_console_report(manager_id="M100")
+    log.info("Step 2: Generating console report for manager_id=%s (no GPT)...", mgr_id)
+    generate_manager_console_report(manager_id=mgr_id)
 
-    # 3) Generate GPT insights for manager M100
-    print("\nStep 3: GPT insights for manager M100...")
-    insights = generate_manager_gpt_insights(manager_id="M100")
-    print("\n=== Final GPT Insights JSON ===")
-    print(json.dumps(insights, indent=2, default=str))
-
-
-# src/llm/prompts.py
-
-"""
-Prompts for TachyonChatManager in HR Employee Insights workflow.
-
-These templates ensure:
- - JSON-only structured output
- - No extra prose
- - Per-employee insight generation
- - Bias comparison (manager rating vs expected score-derived rating)
-"""
-
-MANAGER_INSIGHTS_SYSTEM_PROMPT = (
-    "You are an HR performance and fairness evaluation assistant. "
-    "You analyze structured JSON data containing employee performance metrics, "
-    "feedback signals, behavioral indicators, and manager ratings. "
-    "Your job is to summarize performance, identify bias based on scoring heuristics, "
-    "and provide guidance without accessing any data beyond what is provided. "
-    "Always be objective, neutral, and data-driven."
-)
-
-
-MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
-    "Manager ID: {manager_id}\n\n"
-    "Below is the JSON `report_cards` for all employees under this manager.\n"
-    "Use ONLY this data. Do not hallucinate missing data.\n\n"
-    "----------------------------------------------\n\n"
-    "### REQUIRED OUTPUT FORMAT ###\n"
-    "Respond ONLY with a JSON array where each element has the structure:\n\n"
-    "[\n"
-    "  {{\n"
-    "    \"employee_id\": string,\n"
-    "    \"name\": string,\n"
-    "    \"period_summaries\": [\n"
-    "        {{\n"
-    "           \"period_half\": string,\n"
-    "           \"overall_highlights\": string,\n"
-    "           \"kpi_summary\": string\n"
-    "        }}\n"
-    "    ],\n"
-    "    \"bias_assessment\": {{\n"
-    "        \"manager_rating\": string | null,\n"
-    "        \"expected_rating\": string | null,\n"
-    "        \"comparison\": string | null\n"
-    "        // Allowed comparison values:\n"
-    "        // \"aligned\" | \"manager_slightly_high\" | \"manager_very_high\" |\n"
-    "        // \"manager_slightly_low\" | \"manager_very_low\" | null\n"
-    "    }},\n"
-    "    \"risk_signals\": [string],\n"
-    "    \"development_recommendations\": [string]\n"
-    "  }}\n"
-    "]\n\n"
-    "----------------------------------------------\n\n"
-    "Hard Requirements:\n"
-    "- Output MUST be valid JSON — no text before/after JSON\n"
-    "- If a field is not available, return null or []\n"
-    "- DO NOT invent roles, metrics, or ratings\n"
-    "- If multiple periods exist, analyze each separately and then summarize overall\n"
-    "- Always reference period-specific data first, then long-term combined signals\n\n"
-    "----------------------------------------------\n\n"
-    "Here is the employee data:\n"
-    "{report_cards_json}\n"
-    "----------------------------------------------\n"
-    "Now produce insights in the exact JSON format described above."
-)
-
+    log.info("Step 3: Generating GPT insights for manager_id=%s...", mgr_id)
+    _ = generate_manager_gpt_insights(manager_id=mgr_id)
