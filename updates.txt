@@ -1,56 +1,97 @@
-# main.py
+# src/llm/prompts.py
 
-from src.etl.etl_pipeline import run_etl
-from src.features.feature_engineering import compute_kpis
-from src.llm.generator import (
-    upload_all_report_cards,
-    generate_manager_gpt_insights,
-    generate_manager_console_report,
-    get_current_manager_id,
+"""
+Prompts for TachyonChatManager in HR Employee Insights workflow.
+
+These templates ensure:
+ - JSON-only structured output
+ - No extra prose
+ - Per-employee insight generation
+ - Bias comparison (manager rating vs expected score-derived rating)
+ - Manager comment rewrites
+ - H1 vs H2 trends/anomalies
+ - Future performance prediction
+"""
+
+MANAGER_INSIGHTS_SYSTEM_PROMPT = (
+    "You are an HR performance and fairness evaluation assistant for engineering teams. "
+    "You have access to detailed performance data (KPIs, defects, feedback, manager ratings, "
+    "IDP goals, etc.) for employees via the HR/Tachyon system. "
+    "You will be given a manager ID and the list of that manager's direct-report employee IDs. "
+    "Using only the data available in the system for those employees, you must:\n"
+    "- Summarize performance for each employee.\n"
+    "- Compare the manager's rating to an expected rating implied by the data.\n"
+    "- Identify potential bias (too generous or too harsh) based on that comparison.\n"
+    "- Rewrite manager comments so they are objective and aligned with the calculated rating.\n"
+    "- Track trends and anomalies between H1 and H2.\n"
+    "- Predict likely future performance for each employee.\n"
+    "- Highlight risk signals and provide development recommendations FOR THE EMPLOYEE.\n\n"
+    "You must be objective, neutral, and data-driven. "
+    "Do not hallucinate details that could not be inferred from the underlying data. "
+    "Your final answer must be valid JSON only, with no extra commentary."
 )
-from src.common.logger import get_logger
-
-log = get_logger("main")
 
 
-def main() -> None:
-    # 1) ETL
-    log.info("Running ETL...")
-    etl_result = run_etl()  # dict with at least {"loaded": {...}} and combined_json, etc.
-
-    # 2) Feature engineering / KPIs
-    log.info("Computing features...")
-    features_combined_df, features_by_period_df = compute_kpis(etl_result)
-    log.info(
-        "Features computed: combined rows=%s, by_period rows=%s",
-        len(features_combined_df),
-        len(features_by_period_df),
-    )
-
-    # 3) Build and upload full report cards JSON to Tachyon
-    log.info("Building and uploading report cards JSON to Tachyon...")
-    upload_resp = upload_all_report_cards()
-    log.info("Upload response from Tachyon: %s", upload_resp)
-
-    # 4) Generate insights for current manager (temporary hard-coded helper)
-    manager_id = get_current_manager_id()
-    log.info("Current manager_id (temporary helper) = %s", manager_id)
-
-    # Optional: log a small local console snapshot (no GPT)
-    log.info("Generating console report for manager_id=%s (no GPT)...", manager_id)
-    generate_manager_console_report(manager_id=manager_id)
-
-    # GPT insights (goes via TachyonChatManager, saves JSON to output/)
-    log.info("Generating GPT insights for manager_id=%s...", manager_id)
-    insights = generate_manager_gpt_insights(manager_id=manager_id)
-
-    if isinstance(insights, dict) and insights.get("status") in {"error", "ok_raw"}:
-        log.warning("GPT insights finished with status: %s", insights.get("status"))
-    else:
-        log.info("GPT insights generated successfully.")
-
-    log.info("Pipeline finished. Outputs are in output/ directory.")
-
-
-if __name__ == "__main__":
-    main()
+MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
+    "Manager ID: {manager_id}\n\n"
+    "Here is the list of employee IDs for this manager's direct reports:\n"
+    "{employee_ids}\n\n"
+    "The detailed performance report data for these employees is available to you "
+    "inside the HR/Tachyon system (for example, via an uploaded report file or vector store). "
+    "Use that underlying data to build your analysis.\n\n"
+    "----------------------------------------------\n\n"
+    "### REQUIRED OUTPUT FORMAT ###\n\n"
+    "Respond ONLY with a JSON array, where each element has this structure:\n\n"
+    "[\n"
+    "  {{\n"
+    "    \"employee_id\": string,\n"
+    "    \"name\": string | null,\n"
+    "    \"period_summaries\": [\n"
+    "      {{\n"
+    "        \"period_half\": string | null,\n"
+    "        \"overall_highlights\": string,\n"
+    "        \"kpi_summary\": string,\n"
+    "        \"trend_vs_previous\": string | null,  // e.g. \"improving\", \"declining\", \"stable\", or null for first period\n"
+    "        \"anomalies\": [string],              // unusual jumps/drops or odd patterns between H1 and H2\n"
+    "        \"manager_comment_original\": string | null,\n"
+    "        \"manager_comment_rewrite\": string | null  // unbiased rewrite aligned with expected rating\n"
+    "      }}\n"
+    "    ],\n"
+    "    \"bias_assessment\": {{\n"
+    "      \"manager_rating\": string | null,\n"
+    "      \"expected_rating\": string | null,\n"
+    "      \"comparison\": string | null\n"
+    "      // Allowed comparison values:\n"
+    "      // \"aligned\" |\n"
+    "      // \"manager_slightly_high\" |\n"
+    "      // \"manager_very_high\" |\n"
+    "      // \"manager_slightly_low\" |\n"
+    "      // \"manager_very_low\" |\n"
+    "      // or null if not enough data.\n"
+    "    }},\n"
+    "    \"future_performance\": {{\n"
+    "      \"predicted_rating\": string | null,   // likely next H1/H2 rating based on trends\n"
+    "      \"confidence\": string | null,         // \"low\", \"medium\", or \"high\"\n"
+    "      \"rationale\": string                  // short explanation grounded in KPIs and trends\n"
+    "    }},\n"
+    "    \"risk_signals\": [string],\n"
+    "    \"development_recommendations\": [string]\n"
+    "  }}\n"
+    "]\n\n"
+    "Notes:\n"
+    "- risk_signals MUST be risks for the EMPLOYEE (e.g. \"sustained high spillover\", "
+    "\"increasing escaped defects\", \"negative feedback_360\", \"low RTO compliance\").\n"
+    "- development_recommendations MUST be actions for the EMPLOYEE "
+    "(e.g. \"focus on test coverage\", \"improve stakeholder communication\").\n\n"
+    "----------------------------------------------\n\n"
+    "Hard Requirements:\n"
+    "- Output MUST be valid JSON — no text before or after the JSON.\n"
+    "- If a field is not available, use null or an empty list as appropriate.\n"
+    "- Do NOT invent roles, metrics, or ratings beyond what can be inferred from the data.\n"
+    "- If multiple half-year periods (H1/H2) exist, analyze each separately in "
+    "period_summaries and then reflect H1 vs H2 trends in trend_vs_previous, anomalies, "
+    "bias_assessment, and future_performance.\n"
+    "- Focus on actionable, constructive recommendations for the EMPLOYEE.\n\n"
+    "----------------------------------------------\n"
+    "Now produce the insights in exactly the JSON format described above."
+)
