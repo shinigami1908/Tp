@@ -1,136 +1,165 @@
-```markdown
-# AI-Assisted Performance Review & Bias Analytics Platform
+# src/llm/generator.py
 
-## 🚀 Overview
-Performance reviews often feel subjective and inconsistent.  
-Managers spend significant time navigating multiple systems and still struggle to:
+"""
+LLM orchestration WITHOUT Tachyon file upload.
 
-- Understand true performance impact
-- Detect early warning signals
-- Provide constructive and unbiased feedback
+We directly provide HR report card data for the manager's employees to the GPT prompt.
+"""
 
-This solution transforms employee evaluation into **data-driven decision making** by combining:
-✔ Engineering productivity metrics  
-✔ Learning & presence indicators  
-✔ Manager & peer feedback  
-✔ GPT-powered bias review & narrative insights  
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Any, Optional
 
----
+from src.common.logger import get_logger
+from .llm_generation import TachyonChatManager
+from .prompts import MANAGER_INSIGHTS_SYSTEM_PROMPT, MANAGER_INSIGHTS_USER_FULLDATA_TEMPLATE
 
-## 🎯 Key Capabilities
+log = get_logger("generator")
 
-| Capability | Description |
-|-----------|-------------|
-| Unified Performance ETL | Extracts from Jira / GitHub / LMS / RTO / Manager Inputs |
-| KPI Engine | Normalizes all metrics into objective performance signals |
-| Bias Detection | Flags when manager rating is too high/low vs data |
-| Behavioral Insights | Identifies risk signals + improvement opportunities |
-| H1 vs H2 Trend Insights | Tracks improvement or decline in performance |
-| Automated Narrative | Rewrites manager comments to align with objective data |
-| Future Performance Signals | Predictive insight based on current trajectory |
-| Seamless Manager Dashboard | JSON response ready for UI consumption |
 
----
+def get_current_manager_id() -> str:
+    """Temporary default manager until frontend login is integrated."""
+    return "M100"
 
-## 🧱 Architecture
 
-```
-┌────────────────────────┐
-│ Frontend UI (Login/App)│
-└──────────┬─────────────┘
-           │ Manager ID
-┌──────────▼───────────┐
-│ Backend (main.py)    │
-│ ETL + Scoring Engine │
-└──┬───────────────────┘
-   │ JSON report cards (all employees)
-┌──▼─────────────────────┐
-│ Secure Tachyon Storage │
-└──┬─────────────────────┘
-   │ Vector-aware LLM Query 
-┌──▼──────────────────────────┐
-│ GPT Insights (Bias & Trends)│
-└───────────┬────────────────┘
-            │ JSON insights per employee
-┌───────────▼──────────────┐
-│ Manager Dashboard (UI)   │
-└──────────────────────────┘
-```
+def _json_safe(val: Any) -> Any:
+    if isinstance(val, (np.generic,)):
+        val = val.item()
+    try:
+        if isinstance(val, (float, int, str)) and pd.isna(val):
+            return None
+    except Exception:
+        pass
+    return val
 
-✔ Scales to 1000+ employees per manager  
-✔ No raw CSV ever leaves backend — data secured  
-✔ Tachyon ensures compliant LLM interaction  
 
----
+def _load_frames() -> Optional[tuple]:
+    base_dir = Path(".")
 
-## 🔍 How It Works (Narrative Flow)
+    md = base_dir / "mockdata" / "employees.csv"
+    bp = base_dir / "output" / "features_by_period.json"
+    cb = base_dir / "output" / "features_combined.json"
 
-1️⃣ **Backend loads performance signals**  
-(Version-controlled mockdata used in hackathon)
+    if not (md.exists() and bp.exists() and cb.exists()):
+        log.error("Missing one or more required ETL output files.")
+        return None
 
-2️⃣ **KPIs computed per employee + per period**  
-Feature engineering normalizes:
+    employees_df = pd.read_csv(md)
+    by_period_df = pd.read_json(bp)
+    combined_df = pd.read_json(cb)
 
-- Delivery → story completion ratio
-- Quality → defect escape rate
-- Collaboration → PRs, reviews, sentiments
-- Growth → LMS + IDP progress
-- Presence → RTO compliance
+    for df in [employees_df, by_period_df, combined_df]:
+        df.columns = df.columns.str.strip()
 
-3️⃣ **Expected rating score computed**  
-Transparent rules + red-flag dictionary
+    return employees_df, by_period_df, combined_df
 
-4️⃣ **Bias comparison**
-> "Manager very high / slightly high / aligned / slightly low / very low"
 
-5️⃣ **Report cards bundled & stored in Tachyon**  
-One file per run — manager queries always fetch fresh insights
+def build_manager_reports(manager_id: str) -> List[Dict[str, Any]]:
+    frames = _load_frames()
+    if frames is None:
+        return []
 
-6️⃣ **GPT transforms analytics to human-friendly insights**  
-- Strengths
-- Risks
-- Trends across H1/H2
-- *Rewrites manager comments* where necessary
-- *Predicts likely future performance trajectory*
+    employees_df, by_period_df, combined_df = frames
 
-7️⃣ **Final UI-ready JSON returned**
+    team = employees_df[employees_df["manager_id"] == manager_id]
+    if team.empty:
+        log.warning("No employees for manager %s", manager_id)
+        return []
 
----
+    reports = []
 
-## 🧠 Responsible AI
+    for _, emp in team.iterrows():
+        emp_id = emp["employee_id"]
 
-✔ Strict *no hallucination* rules  
-✔ Insights only from uploaded structured data  
-✔ Transparent metrics → explainable bias detection  
+        periods = by_period_df[by_period_df["employee_id"] == emp_id]
+        combined = combined_df[combined_df["employee_id"] == emp_id]
 
----
+        # JSON safe conversion
+        period_rows = [
+            {c: _json_safe(r[c]) for c in r.index if c != "employee_id"}
+            for _, r in periods.iterrows()
+        ]
 
-## 🧩 Repository Structure
+        combined_dict = (
+            {c: _json_safe(combined.iloc[0][c]) for c in combined.columns if c != "employee_id"}
+            if not combined.empty else {}
+        )
 
-```
-src/
- ├── etl/              # multi-system data loading & cleanup
- ├── features/         # KPI scoring & bias rules
- ├── llm/              # Tachyon + GPT integration
- ├── common/           # logger + utilities
-output/                # generated report cards + GPT insights
-main.py
-README.md
-```
+        reports.append(
+            {
+                "employee_id": emp_id,
+                "name": emp.get("name"),
+                "role": emp.get("role"),
+                "org": emp.get("org"),
+                "periods": period_rows,
+                "combined_extra": combined_dict,
+            }
+        )
 
----
+    return reports
 
-## 🔮 Future Enhancements
-- Promotion readiness prediction
-- Role-based competency skill maps
-- Continuous performance monitoring
-- Manager coaching analytics
 
----
+def _strip_code_fences(raw: str) -> str:
+    txt = raw.strip()
+    if txt.startswith("```"):
+        txt = txt[3:].lstrip()
+        if txt.lower().startswith("json"):
+            txt = txt[4:].lstrip()
+        end = txt.rfind("```")
+        if end != -1:
+            txt = txt[:end].strip()
+    return txt
 
-## 📌 Summary
-We elevate performance reviews:
-**from gut-feel feedback → to meaningful, fair intelligence**
 
-Better insights → Better biases detected → Better outcomes
-```
+def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
+    if manager_id is None:
+        manager_id = get_current_manager_id()
+
+    log.info("Preparing GPT insights for manager %s", manager_id)
+
+    reports = build_manager_reports(manager_id)
+    if not reports:
+        return {"status": "error", "detail": "No employees for manager."}
+
+    # GPT Payload
+    reports_json = json.dumps(reports, indent=2)
+
+    tcm = TachyonChatManager()
+
+    user_prompt = MANAGER_INSIGHTS_USER_FULLDATA_TEMPLATE.format(
+        manager_id=manager_id,
+        report_data=reports_json,
+    )
+
+    messages = [
+        {"role": "system", "content": MANAGER_INSIGHTS_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    resp = tcm.chat_complete(messages=messages)
+
+    try:
+        content = resp.choices[0].message.content
+    except Exception:
+        return {"status": "error", "detail": "Bad GPT response"}
+
+    cleaned = _strip_code_fences(content)
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    output_path = output_dir / f"manager_{manager_id}_insights.json"
+    raw_path = output_dir / f"manager_{manager_id}_insights_raw.txt"
+
+    try:
+        parsed = json.loads(cleaned)
+        json.dump(parsed, open(output_path, "w"), indent=2)
+        return parsed
+    except Exception:
+        open(raw_path, "w").write(content)
+        return {"status": "raw_only", "detail": "JSON parse failed"}
+
+
+if __name__ == "__main__":
+    generate_manager_gpt_insights()
