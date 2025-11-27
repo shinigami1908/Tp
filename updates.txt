@@ -1,55 +1,23 @@
-# main.py
+def generate_manager_console_report(manager_id: Optional[str] = None):
+    """
+    Debug helper: prints a summary of employees under a manager
+    WITHOUT calling GPT.
+    """
+    if manager_id is None:
+        manager_id = get_current_manager_id()
 
-from src.common.logger import get_logger
-from src.etl.etl_pipeline import run_etl
-from src.features.feature_engineering import compute_kpis
-from src.llm.generator import (
-    generate_manager_gpt_insights,
-    generate_manager_console_report,
-    get_current_manager_id,
-)
+    reports = build_manager_reports(manager_id)
+    if not reports:
+        log.warning("No employees for manager %s", manager_id)
+        return
 
-
-log = get_logger("main")
-
-
-def main() -> None:
-    # 1) ETL
-    log.info("Step 1: Running ETL pipeline...")
-    etl_result = run_etl()  # dict with at least {"loaded": {...}} / combined outputs
-
-    # 2) Feature engineering / KPIs
-    log.info("Step 2: Computing features / KPIs...")
-    features_combined_df, features_by_period_df = compute_kpis(etl_result)
-    log.info(
-        "Feature engineering complete: combined rows=%s, by-period rows=%s",
-        len(features_combined_df),
-        len(features_by_period_df),
-    )
-
-    # 3) Determine current manager (placeholder until frontend provides it)
-    manager_id = get_current_manager_id()
-    log.info("Using manager_id=%s for insight generation", manager_id)
-
-    # Optional: local snapshot of raw report data for this manager (no GPT)
-    log.info("Step 3: Building manager report snapshot (no GPT)...")
-    generate_manager_console_report(manager_id=manager_id)
-
-    # 4) Generate GPT insights directly from local report data (no file upload)
-    log.info("Step 4: Generating GPT insights for manager_id=%s...", manager_id)
-    insights = generate_manager_gpt_insights(manager_id=manager_id)
-
-    if isinstance(insights, dict) and insights.get("status") in {"error", "raw_only"}:
-        log.warning(
-            "GPT insights finished with status=%s detail=%s",
-            insights.get("status"),
-            insights.get("detail"),
+    log.info("===== LOCAL MANAGER REPORT (NO GPT) =====")
+    for r in reports:
+        log.info(
+            "Employee: %s | Role: %s | Org: %s | Period Entries: %s",
+            r.get("employee_id"),
+            r.get("role"),
+            r.get("org"),
+            len(r.get("periods", [])),
         )
-    else:
-        log.info("GPT insights generated successfully for manager_id=%s", manager_id)
-
-    log.info("Pipeline finished. Check the output/ directory for JSON artifacts.")
-
-
-if __name__ == "__main__":
-    main()
+    log.info("=========================================")
