@@ -1,58 +1,56 @@
-def upload_all_report_cards(base_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    if base_dir is None:
-        base_dir = Path(".")
+# main.py
 
-    output_dir = base_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+from src.etl.etl_pipeline import run_etl
+from src.features.feature_engineering import compute_kpis
+from src.llm.generator import (
+    upload_all_report_cards,
+    generate_manager_gpt_insights,
+    generate_manager_console_report,
+    get_current_manager_id,
+)
+from src.common.logger import get_logger
 
-    tfm = TachyonFileManager()
+log = get_logger("main")
 
-    # ------------------------------------------
-    # 1️⃣ DELETE previous file before new upload
-    # ------------------------------------------
-    last_id_file = output_dir / "tachyon_last_file_id.txt"
-    last_local_file = output_dir / "tachyon_last_file_name.txt"
 
-    if last_id_file.exists():
-        try:
-            old_file_id = last_id_file.read_text().strip()
-            if old_file_id:
-                log.info(f"Deleting previous Tachyon file: {old_file_id}")
-                tfm.delete_file_from_s3(old_file_id)
-        except Exception as e:
-            log.warning(f"Could not delete previous Tachyon file: {e}")
+def main() -> None:
+    # 1) ETL
+    log.info("Running ETL...")
+    etl_result = run_etl()  # dict with at least {"loaded": {...}} and combined_json, etc.
 
-    if last_local_file.exists():
-        try:
-            old_local_path = output_dir / last_local_file.read_text().strip()
-            if old_local_path.exists():
-                log.info(f"Deleting previous local file: {old_local_path}")
-                old_local_path.unlink()
-        except Exception as e:
-            log.warning(f"Could not delete previous local file: {e}")
+    # 2) Feature engineering / KPIs
+    log.info("Computing features...")
+    features_combined_df, features_by_period_df = compute_kpis(etl_result)
+    log.info(
+        "Features computed: combined rows=%s, by_period rows=%s",
+        len(features_combined_df),
+        len(features_by_period_df),
+    )
 
-    # ------------------------------------------
-    # Continue with new file creation
-    # ------------------------------------------
-    log.info("Building report_cards for all employees...")
-    all_reports = build_all_reports(base_dir=base_dir)
-    if not all_reports:
-        log.error("No report cards built; aborting upload.")
-        return None
+    # 3) Build and upload full report cards JSON to Tachyon
+    log.info("Building and uploading report cards JSON to Tachyon...")
+    upload_resp = upload_all_report_cards()
+    log.info("Upload response from Tachyon: %s", upload_resp)
 
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    report_filename = f"report_cards_all_{timestamp}.json"
-    report_path = output_dir / report_filename
+    # 4) Generate insights for current manager (temporary hard-coded helper)
+    manager_id = get_current_manager_id()
+    log.info("Current manager_id (temporary helper) = %s", manager_id)
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(all_reports, f, indent=2, default=str)
+    # Optional: log a small local console snapshot (no GPT)
+    log.info("Generating console report for manager_id=%s (no GPT)...", manager_id)
+    generate_manager_console_report(manager_id=manager_id)
 
-    # Upload to Tachyon
-    response_obj = tfm.upload_file_s3(str(report_path))
-    new_file_id = response_obj.get("id")
+    # GPT insights (goes via TachyonChatManager, saves JSON to output/)
+    log.info("Generating GPT insights for manager_id=%s...", manager_id)
+    insights = generate_manager_gpt_insights(manager_id=manager_id)
 
-    if new_file_id:
-        last_id_file.write_text(new_file_id, encoding="utf-8")
-        last_local_file.write_text(report_filename, encoding="utf-8")
+    if isinstance(insights, dict) and insights.get("status") in {"error", "ok_raw"}:
+        log.warning("GPT insights finished with status: %s", insights.get("status"))
+    else:
+        log.info("GPT insights generated successfully.")
 
-    return response_obj
+    log.info("Pipeline finished. Outputs are in output/ directory.")
+
+
+if __name__ == "__main__":
+    main()
