@@ -1,97 +1,136 @@
-# src/llm/prompts.py
+```markdown
+# AI-Assisted Performance Review & Bias Analytics Platform
 
-"""
-Prompts for TachyonChatManager in HR Employee Insights workflow.
+## 🚀 Overview
+Performance reviews often feel subjective and inconsistent.  
+Managers spend significant time navigating multiple systems and still struggle to:
 
-These templates ensure:
- - JSON-only structured output
- - No extra prose
- - Per-employee insight generation
- - Bias comparison (manager rating vs expected score-derived rating)
- - Manager comment rewrites
- - H1 vs H2 trends/anomalies
- - Future performance prediction
-"""
+- Understand true performance impact
+- Detect early warning signals
+- Provide constructive and unbiased feedback
 
-MANAGER_INSIGHTS_SYSTEM_PROMPT = (
-    "You are an HR performance and fairness evaluation assistant for engineering teams. "
-    "You have access to detailed performance data (KPIs, defects, feedback, manager ratings, "
-    "IDP goals, etc.) for employees via the HR/Tachyon system. "
-    "You will be given a manager ID and the list of that manager's direct-report employee IDs. "
-    "Using only the data available in the system for those employees, you must:\n"
-    "- Summarize performance for each employee.\n"
-    "- Compare the manager's rating to an expected rating implied by the data.\n"
-    "- Identify potential bias (too generous or too harsh) based on that comparison.\n"
-    "- Rewrite manager comments so they are objective and aligned with the calculated rating.\n"
-    "- Track trends and anomalies between H1 and H2.\n"
-    "- Predict likely future performance for each employee.\n"
-    "- Highlight risk signals and provide development recommendations FOR THE EMPLOYEE.\n\n"
-    "You must be objective, neutral, and data-driven. "
-    "Do not hallucinate details that could not be inferred from the underlying data. "
-    "Your final answer must be valid JSON only, with no extra commentary."
-)
+This solution transforms employee evaluation into **data-driven decision making** by combining:
+✔ Engineering productivity metrics  
+✔ Learning & presence indicators  
+✔ Manager & peer feedback  
+✔ GPT-powered bias review & narrative insights  
 
+---
 
-MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
-    "Manager ID: {manager_id}\n\n"
-    "Here is the list of employee IDs for this manager's direct reports:\n"
-    "{employee_ids}\n\n"
-    "The detailed performance report data for these employees is available to you "
-    "inside the HR/Tachyon system (for example, via an uploaded report file or vector store). "
-    "Use that underlying data to build your analysis.\n\n"
-    "----------------------------------------------\n\n"
-    "### REQUIRED OUTPUT FORMAT ###\n\n"
-    "Respond ONLY with a JSON array, where each element has this structure:\n\n"
-    "[\n"
-    "  {{\n"
-    "    \"employee_id\": string,\n"
-    "    \"name\": string | null,\n"
-    "    \"period_summaries\": [\n"
-    "      {{\n"
-    "        \"period_half\": string | null,\n"
-    "        \"overall_highlights\": string,\n"
-    "        \"kpi_summary\": string,\n"
-    "        \"trend_vs_previous\": string | null,  // e.g. \"improving\", \"declining\", \"stable\", or null for first period\n"
-    "        \"anomalies\": [string],              // unusual jumps/drops or odd patterns between H1 and H2\n"
-    "        \"manager_comment_original\": string | null,\n"
-    "        \"manager_comment_rewrite\": string | null  // unbiased rewrite aligned with expected rating\n"
-    "      }}\n"
-    "    ],\n"
-    "    \"bias_assessment\": {{\n"
-    "      \"manager_rating\": string | null,\n"
-    "      \"expected_rating\": string | null,\n"
-    "      \"comparison\": string | null\n"
-    "      // Allowed comparison values:\n"
-    "      // \"aligned\" |\n"
-    "      // \"manager_slightly_high\" |\n"
-    "      // \"manager_very_high\" |\n"
-    "      // \"manager_slightly_low\" |\n"
-    "      // \"manager_very_low\" |\n"
-    "      // or null if not enough data.\n"
-    "    }},\n"
-    "    \"future_performance\": {{\n"
-    "      \"predicted_rating\": string | null,   // likely next H1/H2 rating based on trends\n"
-    "      \"confidence\": string | null,         // \"low\", \"medium\", or \"high\"\n"
-    "      \"rationale\": string                  // short explanation grounded in KPIs and trends\n"
-    "    }},\n"
-    "    \"risk_signals\": [string],\n"
-    "    \"development_recommendations\": [string]\n"
-    "  }}\n"
-    "]\n\n"
-    "Notes:\n"
-    "- risk_signals MUST be risks for the EMPLOYEE (e.g. \"sustained high spillover\", "
-    "\"increasing escaped defects\", \"negative feedback_360\", \"low RTO compliance\").\n"
-    "- development_recommendations MUST be actions for the EMPLOYEE "
-    "(e.g. \"focus on test coverage\", \"improve stakeholder communication\").\n\n"
-    "----------------------------------------------\n\n"
-    "Hard Requirements:\n"
-    "- Output MUST be valid JSON — no text before or after the JSON.\n"
-    "- If a field is not available, use null or an empty list as appropriate.\n"
-    "- Do NOT invent roles, metrics, or ratings beyond what can be inferred from the data.\n"
-    "- If multiple half-year periods (H1/H2) exist, analyze each separately in "
-    "period_summaries and then reflect H1 vs H2 trends in trend_vs_previous, anomalies, "
-    "bias_assessment, and future_performance.\n"
-    "- Focus on actionable, constructive recommendations for the EMPLOYEE.\n\n"
-    "----------------------------------------------\n"
-    "Now produce the insights in exactly the JSON format described above."
-)
+## 🎯 Key Capabilities
+
+| Capability | Description |
+|-----------|-------------|
+| Unified Performance ETL | Extracts from Jira / GitHub / LMS / RTO / Manager Inputs |
+| KPI Engine | Normalizes all metrics into objective performance signals |
+| Bias Detection | Flags when manager rating is too high/low vs data |
+| Behavioral Insights | Identifies risk signals + improvement opportunities |
+| H1 vs H2 Trend Insights | Tracks improvement or decline in performance |
+| Automated Narrative | Rewrites manager comments to align with objective data |
+| Future Performance Signals | Predictive insight based on current trajectory |
+| Seamless Manager Dashboard | JSON response ready for UI consumption |
+
+---
+
+## 🧱 Architecture
+
+```
+┌────────────────────────┐
+│ Frontend UI (Login/App)│
+└──────────┬─────────────┘
+           │ Manager ID
+┌──────────▼───────────┐
+│ Backend (main.py)    │
+│ ETL + Scoring Engine │
+└──┬───────────────────┘
+   │ JSON report cards (all employees)
+┌──▼─────────────────────┐
+│ Secure Tachyon Storage │
+└──┬─────────────────────┘
+   │ Vector-aware LLM Query 
+┌──▼──────────────────────────┐
+│ GPT Insights (Bias & Trends)│
+└───────────┬────────────────┘
+            │ JSON insights per employee
+┌───────────▼──────────────┐
+│ Manager Dashboard (UI)   │
+└──────────────────────────┘
+```
+
+✔ Scales to 1000+ employees per manager  
+✔ No raw CSV ever leaves backend — data secured  
+✔ Tachyon ensures compliant LLM interaction  
+
+---
+
+## 🔍 How It Works (Narrative Flow)
+
+1️⃣ **Backend loads performance signals**  
+(Version-controlled mockdata used in hackathon)
+
+2️⃣ **KPIs computed per employee + per period**  
+Feature engineering normalizes:
+
+- Delivery → story completion ratio
+- Quality → defect escape rate
+- Collaboration → PRs, reviews, sentiments
+- Growth → LMS + IDP progress
+- Presence → RTO compliance
+
+3️⃣ **Expected rating score computed**  
+Transparent rules + red-flag dictionary
+
+4️⃣ **Bias comparison**
+> "Manager very high / slightly high / aligned / slightly low / very low"
+
+5️⃣ **Report cards bundled & stored in Tachyon**  
+One file per run — manager queries always fetch fresh insights
+
+6️⃣ **GPT transforms analytics to human-friendly insights**  
+- Strengths
+- Risks
+- Trends across H1/H2
+- *Rewrites manager comments* where necessary
+- *Predicts likely future performance trajectory*
+
+7️⃣ **Final UI-ready JSON returned**
+
+---
+
+## 🧠 Responsible AI
+
+✔ Strict *no hallucination* rules  
+✔ Insights only from uploaded structured data  
+✔ Transparent metrics → explainable bias detection  
+
+---
+
+## 🧩 Repository Structure
+
+```
+src/
+ ├── etl/              # multi-system data loading & cleanup
+ ├── features/         # KPI scoring & bias rules
+ ├── llm/              # Tachyon + GPT integration
+ ├── common/           # logger + utilities
+output/                # generated report cards + GPT insights
+main.py
+README.md
+```
+
+---
+
+## 🔮 Future Enhancements
+- Promotion readiness prediction
+- Role-based competency skill maps
+- Continuous performance monitoring
+- Manager coaching analytics
+
+---
+
+## 📌 Summary
+We elevate performance reviews:
+**from gut-feel feedback → to meaningful, fair intelligence**
+
+Better insights → Better biases detected → Better outcomes
+```
