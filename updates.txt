@@ -1,61 +1,55 @@
-# src/llm/prompts.py
+# main.py
 
-"""
-Prompts for GPT insight generation.
-
-We pass the full JSON report card data for only the employees under the logged-in manager.
-"""
-
-MANAGER_INSIGHTS_SYSTEM_PROMPT = (
-    "You are an HR performance and fairness evaluation assistant for engineering teams. "
-    "You have structured performance data on employees: KPIs by period, manager ratings, "
-    "IDP goals, achievements, risks, and development recommendations. "
-    "Your job is to analyze the provided JSON and generate unbiased, actionable insights.\n\n"
-    "REQUIREMENTS:\n"
-    "- Stay strictly grounded in the data.\n"
-    "- Do NOT hallucinate missing information.\n"
-    "- Compare manager rating vs. expected rating:\n"
-    "    aligned | manager_slightly_high | manager_very_high | manager_slightly_low | manager_very_low\n"
-    "- Identify potential fairness/bias concerns.\n"
-    "- Provide concise performance summaries and constructive development recommendations.\n"
-    "- No narrative outside the JSON structure.\n"
-    "- Output must be exactly valid JSON, no markdown or backticks."
+from src.common.logger import get_logger
+from src.etl.etl_pipeline import run_etl
+from src.features.feature_engineering import compute_kpis
+from src.llm.generator import (
+    generate_manager_gpt_insights,
+    generate_manager_console_report,
+    get_current_manager_id,
 )
 
-MANAGER_INSIGHTS_USER_FULLDATA_TEMPLATE = (
-    "Manager ID: {manager_id}\n\n"
-    "Below is performance report data for the manager's direct reports.\n"
-    "Use this data ONLY — do not assume anything beyond what is present.\n\n"
-    "---------------- DATA BEGIN ----------------\n"
-    "{report_data}\n"
-    "---------------- DATA END ----------------\n\n"
-    "Your response MUST be:\n"
-    "- Valid JSON\n"
-    "- A list where each element corresponds to one employee\n"
-    "- Sorted by employee_id ascending\n\n"
-    "### REQUIRED OUTPUT FORMAT ###\n"
-    "[\n"
-    "  {\n"
-    "    \"employee_id\": string,\n"
-    "    \"name\": string | null,\n"
-    "    \"period_summaries\": [\n"
-    "      {\n"
-    "        \"period_half\": string | null,\n"
-    "        \"overall_highlights\": string,\n"
-    "        \"kpi_summary\": string\n"
-    "      }\n"
-    "    ],\n"
-    "    \"bias_assessment\": {\n"
-    "      \"manager_rating\": string | null,\n"
-    "      \"expected_rating\": string | null,\n"
-    "      \"comparison\": string | null\n"
-    "    },\n"
-    "    \"risk_signals\": [string],\n"
-    "    \"development_recommendations\": [string]\n"
-    "  }\n"
-    "]\n\n"
-    "Reminder:\n"
-    "- No markdown formatting\n"
-    "- No ```json fences\n"
-    "- No commentary outside JSON\n"
-)
+
+log = get_logger("main")
+
+
+def main() -> None:
+    # 1) ETL
+    log.info("Step 1: Running ETL pipeline...")
+    etl_result = run_etl()  # dict with at least {"loaded": {...}} / combined outputs
+
+    # 2) Feature engineering / KPIs
+    log.info("Step 2: Computing features / KPIs...")
+    features_combined_df, features_by_period_df = compute_kpis(etl_result)
+    log.info(
+        "Feature engineering complete: combined rows=%s, by-period rows=%s",
+        len(features_combined_df),
+        len(features_by_period_df),
+    )
+
+    # 3) Determine current manager (placeholder until frontend provides it)
+    manager_id = get_current_manager_id()
+    log.info("Using manager_id=%s for insight generation", manager_id)
+
+    # Optional: local snapshot of raw report data for this manager (no GPT)
+    log.info("Step 3: Building manager report snapshot (no GPT)...")
+    generate_manager_console_report(manager_id=manager_id)
+
+    # 4) Generate GPT insights directly from local report data (no file upload)
+    log.info("Step 4: Generating GPT insights for manager_id=%s...", manager_id)
+    insights = generate_manager_gpt_insights(manager_id=manager_id)
+
+    if isinstance(insights, dict) and insights.get("status") in {"error", "raw_only"}:
+        log.warning(
+            "GPT insights finished with status=%s detail=%s",
+            insights.get("status"),
+            insights.get("detail"),
+        )
+    else:
+        log.info("GPT insights generated successfully for manager_id=%s", manager_id)
+
+    log.info("Pipeline finished. Check the output/ directory for JSON artifacts.")
+
+
+if __name__ == "__main__":
+    main()
