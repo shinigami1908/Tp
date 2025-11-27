@@ -1,165 +1,61 @@
-# src/llm/generator.py
+# src/llm/prompts.py
 
 """
-LLM orchestration WITHOUT Tachyon file upload.
+Prompts for GPT insight generation.
 
-We directly provide HR report card data for the manager's employees to the GPT prompt.
+We pass the full JSON report card data for only the employees under the logged-in manager.
 """
 
-from pathlib import Path
-import json
-import numpy as np
-import pandas as pd
-from typing import List, Dict, Any, Optional
+MANAGER_INSIGHTS_SYSTEM_PROMPT = (
+    "You are an HR performance and fairness evaluation assistant for engineering teams. "
+    "You have structured performance data on employees: KPIs by period, manager ratings, "
+    "IDP goals, achievements, risks, and development recommendations. "
+    "Your job is to analyze the provided JSON and generate unbiased, actionable insights.\n\n"
+    "REQUIREMENTS:\n"
+    "- Stay strictly grounded in the data.\n"
+    "- Do NOT hallucinate missing information.\n"
+    "- Compare manager rating vs. expected rating:\n"
+    "    aligned | manager_slightly_high | manager_very_high | manager_slightly_low | manager_very_low\n"
+    "- Identify potential fairness/bias concerns.\n"
+    "- Provide concise performance summaries and constructive development recommendations.\n"
+    "- No narrative outside the JSON structure.\n"
+    "- Output must be exactly valid JSON, no markdown or backticks."
+)
 
-from src.common.logger import get_logger
-from .llm_generation import TachyonChatManager
-from .prompts import MANAGER_INSIGHTS_SYSTEM_PROMPT, MANAGER_INSIGHTS_USER_FULLDATA_TEMPLATE
-
-log = get_logger("generator")
-
-
-def get_current_manager_id() -> str:
-    """Temporary default manager until frontend login is integrated."""
-    return "M100"
-
-
-def _json_safe(val: Any) -> Any:
-    if isinstance(val, (np.generic,)):
-        val = val.item()
-    try:
-        if isinstance(val, (float, int, str)) and pd.isna(val):
-            return None
-    except Exception:
-        pass
-    return val
-
-
-def _load_frames() -> Optional[tuple]:
-    base_dir = Path(".")
-
-    md = base_dir / "mockdata" / "employees.csv"
-    bp = base_dir / "output" / "features_by_period.json"
-    cb = base_dir / "output" / "features_combined.json"
-
-    if not (md.exists() and bp.exists() and cb.exists()):
-        log.error("Missing one or more required ETL output files.")
-        return None
-
-    employees_df = pd.read_csv(md)
-    by_period_df = pd.read_json(bp)
-    combined_df = pd.read_json(cb)
-
-    for df in [employees_df, by_period_df, combined_df]:
-        df.columns = df.columns.str.strip()
-
-    return employees_df, by_period_df, combined_df
-
-
-def build_manager_reports(manager_id: str) -> List[Dict[str, Any]]:
-    frames = _load_frames()
-    if frames is None:
-        return []
-
-    employees_df, by_period_df, combined_df = frames
-
-    team = employees_df[employees_df["manager_id"] == manager_id]
-    if team.empty:
-        log.warning("No employees for manager %s", manager_id)
-        return []
-
-    reports = []
-
-    for _, emp in team.iterrows():
-        emp_id = emp["employee_id"]
-
-        periods = by_period_df[by_period_df["employee_id"] == emp_id]
-        combined = combined_df[combined_df["employee_id"] == emp_id]
-
-        # JSON safe conversion
-        period_rows = [
-            {c: _json_safe(r[c]) for c in r.index if c != "employee_id"}
-            for _, r in periods.iterrows()
-        ]
-
-        combined_dict = (
-            {c: _json_safe(combined.iloc[0][c]) for c in combined.columns if c != "employee_id"}
-            if not combined.empty else {}
-        )
-
-        reports.append(
-            {
-                "employee_id": emp_id,
-                "name": emp.get("name"),
-                "role": emp.get("role"),
-                "org": emp.get("org"),
-                "periods": period_rows,
-                "combined_extra": combined_dict,
-            }
-        )
-
-    return reports
-
-
-def _strip_code_fences(raw: str) -> str:
-    txt = raw.strip()
-    if txt.startswith("```"):
-        txt = txt[3:].lstrip()
-        if txt.lower().startswith("json"):
-            txt = txt[4:].lstrip()
-        end = txt.rfind("```")
-        if end != -1:
-            txt = txt[:end].strip()
-    return txt
-
-
-def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
-    if manager_id is None:
-        manager_id = get_current_manager_id()
-
-    log.info("Preparing GPT insights for manager %s", manager_id)
-
-    reports = build_manager_reports(manager_id)
-    if not reports:
-        return {"status": "error", "detail": "No employees for manager."}
-
-    # GPT Payload
-    reports_json = json.dumps(reports, indent=2)
-
-    tcm = TachyonChatManager()
-
-    user_prompt = MANAGER_INSIGHTS_USER_FULLDATA_TEMPLATE.format(
-        manager_id=manager_id,
-        report_data=reports_json,
-    )
-
-    messages = [
-        {"role": "system", "content": MANAGER_INSIGHTS_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    resp = tcm.chat_complete(messages=messages)
-
-    try:
-        content = resp.choices[0].message.content
-    except Exception:
-        return {"status": "error", "detail": "Bad GPT response"}
-
-    cleaned = _strip_code_fences(content)
-    output_dir = Path("output")
-    output_dir.mkdir(exist_ok=True)
-
-    output_path = output_dir / f"manager_{manager_id}_insights.json"
-    raw_path = output_dir / f"manager_{manager_id}_insights_raw.txt"
-
-    try:
-        parsed = json.loads(cleaned)
-        json.dump(parsed, open(output_path, "w"), indent=2)
-        return parsed
-    except Exception:
-        open(raw_path, "w").write(content)
-        return {"status": "raw_only", "detail": "JSON parse failed"}
-
-
-if __name__ == "__main__":
-    generate_manager_gpt_insights()
+MANAGER_INSIGHTS_USER_FULLDATA_TEMPLATE = (
+    "Manager ID: {manager_id}\n\n"
+    "Below is performance report data for the manager's direct reports.\n"
+    "Use this data ONLY — do not assume anything beyond what is present.\n\n"
+    "---------------- DATA BEGIN ----------------\n"
+    "{report_data}\n"
+    "---------------- DATA END ----------------\n\n"
+    "Your response MUST be:\n"
+    "- Valid JSON\n"
+    "- A list where each element corresponds to one employee\n"
+    "- Sorted by employee_id ascending\n\n"
+    "### REQUIRED OUTPUT FORMAT ###\n"
+    "[\n"
+    "  {\n"
+    "    \"employee_id\": string,\n"
+    "    \"name\": string | null,\n"
+    "    \"period_summaries\": [\n"
+    "      {\n"
+    "        \"period_half\": string | null,\n"
+    "        \"overall_highlights\": string,\n"
+    "        \"kpi_summary\": string\n"
+    "      }\n"
+    "    ],\n"
+    "    \"bias_assessment\": {\n"
+    "      \"manager_rating\": string | null,\n"
+    "      \"expected_rating\": string | null,\n"
+    "      \"comparison\": string | null\n"
+    "    },\n"
+    "    \"risk_signals\": [string],\n"
+    "    \"development_recommendations\": [string]\n"
+    "  }\n"
+    "]\n\n"
+    "Reminder:\n"
+    "- No markdown formatting\n"
+    "- No ```json fences\n"
+    "- No commentary outside JSON\n"
+)
