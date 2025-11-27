@@ -1,76 +1,58 @@
-# src/llm/prompts.py
+def upload_all_report_cards(base_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    if base_dir is None:
+        base_dir = Path(".")
 
-"""
-Prompts for TachyonChatManager in HR Employee Insights workflow.
+    output_dir = base_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-These templates ensure:
- - JSON-only structured output
- - No extra prose
- - Per-employee insight generation
- - Bias comparison (manager rating vs expected score-derived rating)
-"""
+    tfm = TachyonFileManager()
 
-MANAGER_INSIGHTS_SYSTEM_PROMPT = (
-    "You are an HR performance and fairness evaluation assistant for engineering teams. "
-    "You have access to detailed performance data (KPIs, defects, feedback, manager ratings, "
-    "IDP goals, etc.) for employees via the HR/Tachyon system. "
-    "You will be given a manager ID and the list of that manager's direct-report employee IDs. "
-    "Using only the data available in the system for those employees, you must:\n"
-    "- Summarize performance for each employee.\n"
-    "- Compare the manager's rating to an expected rating implied by the data.\n"
-    "- Identify potential bias (too generous or too harsh) based on that comparison.\n"
-    "- Highlight risk signals and provide development recommendations.\n\n"
-    "You must be objective, neutral, and data-driven. "
-    "Do not hallucinate details that could not be inferred from the underlying data. "
-    "Your final answer must be valid JSON only, with no extra commentary."
-)
+    # ------------------------------------------
+    # 1️⃣ DELETE previous file before new upload
+    # ------------------------------------------
+    last_id_file = output_dir / "tachyon_last_file_id.txt"
+    last_local_file = output_dir / "tachyon_last_file_name.txt"
 
+    if last_id_file.exists():
+        try:
+            old_file_id = last_id_file.read_text().strip()
+            if old_file_id:
+                log.info(f"Deleting previous Tachyon file: {old_file_id}")
+                tfm.delete_file_from_s3(old_file_id)
+        except Exception as e:
+            log.warning(f"Could not delete previous Tachyon file: {e}")
 
-MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
-    "Manager ID: {manager_id}\n\n"
-    "Here is the list of employee IDs for this manager's direct reports:\n"
-    "{employee_ids}\n\n"
-    "The detailed performance report data for these employees is available to you "
-    "inside the HR/Tachyon system (for example, via an uploaded report file or vector store). "
-    "Use that underlying data to build your analysis.\n\n"
-    "----------------------------------------------\n\n"
-    "### REQUIRED OUTPUT FORMAT ###\n\n"
-    "Respond ONLY with a JSON array, where each element has this structure:\n\n"
-    "[\n"
-    "  {{\n"
-    "    \"employee_id\": string,\n"
-    "    \"name\": string | null,\n"
-    "    \"period_summaries\": [\n"
-    "      {{\n"
-    "        \"period_half\": string | null,\n"
-    "        \"overall_highlights\": string,\n"
-    "        \"kpi_summary\": string\n"
-    "      }}\n"
-    "    ],\n"
-    "    \"bias_assessment\": {{\n"
-    "      \"manager_rating\": string | null,\n"
-    "      \"expected_rating\": string | null,\n"
-    "      \"comparison\": string | null\n"
-    "      // Allowed comparison values:\n"
-    "      // \"aligned\" |\n"
-    "      // \"manager_slightly_high\" |\n"
-    "      // \"manager_very_high\" |\n"
-    "      // \"manager_slightly_low\" |\n"
-    "      // \"manager_very_low\" |\n"
-    "      // or null if not enough data.\n"
-    "    }},\n"
-    "    \"risk_signals\": [string],\n"
-    "    \"development_recommendations\": [string]\n"
-    "  }}\n"
-    "]\n\n"
-    "----------------------------------------------\n\n"
-    "Hard Requirements:\n"
-    "- Output MUST be valid JSON — no text before or after the JSON.\n"
-    "- If a field is not available, use null or an empty list as appropriate.\n"
-    "- Do NOT invent roles, metrics, or ratings beyond what can be inferred from the data.\n"
-    "- If multiple half-year periods (H1/H2) exist, analyze each separately in "
-    "period_summaries and then implicitly reflect that in your bias and recommendations.\n"
-    "- Focus on actionable, constructive recommendations for the manager.\n\n"
-    "----------------------------------------------\n"
-    "Now produce the insights in exactly the JSON format described above."
-)
+    if last_local_file.exists():
+        try:
+            old_local_path = output_dir / last_local_file.read_text().strip()
+            if old_local_path.exists():
+                log.info(f"Deleting previous local file: {old_local_path}")
+                old_local_path.unlink()
+        except Exception as e:
+            log.warning(f"Could not delete previous local file: {e}")
+
+    # ------------------------------------------
+    # Continue with new file creation
+    # ------------------------------------------
+    log.info("Building report_cards for all employees...")
+    all_reports = build_all_reports(base_dir=base_dir)
+    if not all_reports:
+        log.error("No report cards built; aborting upload.")
+        return None
+
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    report_filename = f"report_cards_all_{timestamp}.json"
+    report_path = output_dir / report_filename
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(all_reports, f, indent=2, default=str)
+
+    # Upload to Tachyon
+    response_obj = tfm.upload_file_s3(str(report_path))
+    new_file_id = response_obj.get("id")
+
+    if new_file_id:
+        last_id_file.write_text(new_file_id, encoding="utf-8")
+        last_local_file.write_text(report_filename, encoding="utf-8")
+
+    return response_obj
