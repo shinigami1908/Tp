@@ -1,485 +1,33 @@
-# src/llm/generator.py
-
-"""
-LLM / reporting orchestration module (no file upload).
-
-Responsibilities:
-  - Build per-employee, per-manager report-card structures from ETL outputs.
-  - Write all report cards to output/report_cards_all.json.
-  - For a given manager_id, build the subset of report_cards and call GPT
-    (via TachyonChatManager) to get JSON insights — one section per employee.
-
-Inputs (from ETL / feature engineering):
-  - mockdata/employees.csv
-  - output/features_by_period.json
-  - output/features_combined.json
-"""
-
-from pathlib import Path
-import json
-from typing import List, Dict, Any, Optional
-
-import numpy as np
-import pandas as pd
-
-from src.common.logger import get_logger
-from .llm_generation import TachyonChatManager
-from .prompts import (
-    MANAGER_INSIGHTS_SYSTEM_PROMPT,
-    MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE,
-)
-
-log = get_logger("generator")
-
-
-# ------------------------ Manager ID helper ------------------------
-
-
-def get_current_manager_id() -> str:
-    """
-    Temporary helper: returns the current manager_id.
-    For now, this is hard-coded to 'M100' for local testing.
-
-    When frontend integration is ready, replace this implementation
-    to read the logged-in manager's ID from session / JWT / request.
-    """
-    return "M100"
-
-
-# ------------------------ Helpers ------------------------
-
-
-def _json_safe(val: Any) -> Any:
-    """
-    Normalize numpy types / NaN to JSON-friendly primitives.
-    Leaves lists/dicts as-is.
-    """
-    if isinstance(val, (np.generic,)):
-        val = val.item()
-
-    try:
-        if isinstance(val, (float, int, str)) and pd.isna(val):
-            return None
-    except TypeError:
-        # pd.isna on list/dict raises; ignore
-        pass
-
-    return val
-
-
-def _load_core_frames(base_dir: Optional[Path] = None):
-    """
-    Load employees.csv, features_by_period.json, features_combined.json.
-    Returns (employees_df, by_period_df, combined_df) or (None, None, None) on error.
-    Adds defensive checks so KeyError('employee_id') cannot crash.
-    """
-    if base_dir is None:
-        base_dir = Path(".")
-
-    mockdata_dir = base_dir / "mockdata"
-    output_dir = base_dir / "output"
-
-    employees_path = mockdata_dir / "employees.csv"
-    by_period_path = output_dir / "features_by_period.json"
-    combined_path = output_dir / "features_combined.json"
-
-    if not employees_path.exists():
-        log.error("employees.csv not found at %s", employees_path)
-        return None, None, None
-
-    if not by_period_path.exists():
-        log.error("features_by_period.json not found at %s", by_period_path)
-        return None, None, None
-
-    if not combined_path.exists():
-        log.error("features_combined.json not found at %s", combined_path)
-        return None, None, None
-
-    employees_df = pd.read_csv(employees_path)
-    by_period_df = pd.read_json(by_period_path)
-    combined_df = pd.read_json(combined_path)
-
-    # Normalize column names just for safety (strip spaces)
-    employees_df.columns = employees_df.columns.str.strip()
-    by_period_df.columns = by_period_df.columns.str.strip()
-    combined_df.columns = combined_df.columns.str.strip()
-
-    # Defensive: ensure employee_id exists where we expect it
-    for name, df in [
-        ("employees.csv", employees_df),
-        ("features_by_period.json", by_period_df),
-        ("features_combined.json", combined_df),
-    ]:
-        if "employee_id" not in df.columns:
-            log.error(
-                "%s is missing 'employee_id' column. Columns present: %s",
-                name,
-                list(df.columns),
-            )
-            return None, None, None
-
-    return employees_df, by_period_df, combined_df
-
-
-# ------------------------ Report builders ------------------------
-
-
-def build_all_reports(base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """
-    Build report-cards for ALL employees in the system (no manager filter).
-
-    For each employee, returns:
-      {
-        "employee_id": ...,
-        "name": ...,
-        "role": ...,
-        "org": ...,
-        "manager_id": ...,
-        "periods": [ { <all period columns except employee_id> }, ... ],
-        "combined_extra": { <all combined columns except employee_id> }
-      }
-    """
-    employees_df, by_period_df, combined_df = _load_core_frames(base_dir)
-    if employees_df is None:
-        return []
-
-    period_all_cols = list(by_period_df.columns)
-    period_col_set = set(by_period_df.columns)
-    combined_all_cols = [c for c in combined_df.columns if c not in period_col_set]
-
-    period_all_cols_no_emp = [c for c in period_all_cols if c != "employee_id"]
-    combined_extra_cols = [c for c in combined_all_cols if c != "employee_id"]
-
-    report_cards: List[Dict[str, Any]] = []
-
-    # keep deterministic order by employee_id
-    employees_df_sorted = employees_df.sort_values("employee_id")
-
-    for _, emp_row in employees_df_sorted.iterrows():
-        emp_id = emp_row.get("employee_id")
-        name = emp_row.get("name")
-        role = emp_row.get("role")
-        org = emp_row.get("org")
-        manager_id = emp_row.get("manager_id")
-
-        emp_period_rows = by_period_df[by_period_df["employee_id"] == emp_id].copy()
-        emp_combined = combined_df[combined_df["employee_id"] == emp_id].copy()
-
-        periods: List[Dict[str, Any]] = []
-        for _, prow in emp_period_rows.iterrows():
-            row_dict: Dict[str, Any] = {}
-            for col in period_all_cols_no_emp:
-                if col in prow.index:
-                    row_dict[col] = _json_safe(prow[col])
-            periods.append(row_dict)
-
-        combined_extra: Dict[str, Any] = {}
-        if not emp_combined.empty:
-            crow = emp_combined.iloc[0]
-            for col in combined_extra_cols:
-                if col in crow.index:
-                    combined_extra[col] = _json_safe(crow[col])
-
-        report = {
-            "employee_id": emp_id,
-            "name": name,
-            "role": role,
-            "org": org,
-            "manager_id": manager_id,
-            "periods": periods,
-            "combined_extra": combined_extra,
-        }
-        report_cards.append(report)
-
-    log.info("Built %d total report cards for all employees", len(report_cards))
-    return report_cards
-
-
-def write_report_cards_all(base_dir: Optional[Path] = None) -> Optional[Path]:
-    """
-    Build report cards for all employees and write them to:
-      output/report_cards_all.json
-
-    Returns the Path to the file or None on error.
-    """
-    if base_dir is None:
-        base_dir = Path(".")
-
-    output_dir = base_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info("Building report_cards_all.json for all employees...")
-    all_reports = build_all_reports(base_dir=base_dir)
-    if not all_reports:
-        log.error("No report cards built; not writing report_cards_all.json.")
-        return None
-
-    report_path = output_dir / "report_cards_all.json"
-
-    try:
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(all_reports, f, indent=2, default=str)
-        log.info("Wrote report_cards_all.json to %s", report_path)
-    except Exception as e:
-        log.exception("Failed to write report_cards_all.json: %s", e)
-        return None
-
-    return report_path
-
-
-def build_manager_reports(
-    manager_id: str,
-    base_dir: Optional[Path] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Build report-card structures for all employees under the given manager_id.
-
-    Uses the same shape as build_all_reports().
-    """
-    employees_df, by_period_df, combined_df = _load_core_frames(base_dir)
-    if employees_df is None:
-        return []
-
-    if "manager_id" not in employees_df.columns:
-        log.error(
-            "employees.csv is missing 'manager_id' column. Columns present: %s",
-            list(employees_df.columns),
-        )
-        return []
-
-    team_df = employees_df[employees_df["manager_id"] == manager_id].copy()
-    if team_df.empty:
-        log.warning("No employees found under manager_id=%s", manager_id)
-        return []
-
-    # keep deterministic order by employee_id
-    team_df = team_df.sort_values("employee_id")
-
-    period_all_cols = list(by_period_df.columns)
-    period_col_set = set(by_period_df.columns)
-    combined_all_cols = [c for c in combined_df.columns if c not in period_col_set]
-
-    period_all_cols_no_emp = [c for c in period_all_cols if c != "employee_id"]
-    combined_extra_cols = [c for c in combined_all_cols if c != "employee_id"]
-
-    by_period_team = by_period_df[by_period_df["employee_id"].isin(team_df["employee_id"])].copy()
-    combined_team = combined_df[combined_df["employee_id"].isin(team_df["employee_id"])].copy()
-
-    report_cards: List[Dict[str, Any]] = []
-
-    for _, emp_row in team_df.iterrows():
-        emp_id = emp_row.get("employee_id")
-        name = emp_row.get("name")
-        role = emp_row.get("role")
-        org = emp_row.get("org")
-
-        emp_period_rows = by_period_team[by_period_team["employee_id"] == emp_id].copy()
-        emp_combined = combined_team[combined_team["employee_id"] == emp_id].copy()
-
-        periods: List[Dict[str, Any]] = []
-        for _, prow in emp_period_rows.iterrows():
-            row_dict: Dict[str, Any] = {}
-            for col in period_all_cols_no_emp:
-                if col in prow.index:
-                    row_dict[col] = _json_safe(prow[col])
-            periods.append(row_dict)
-
-        combined_extra: Dict[str, Any] = {}
-        if not emp_combined.empty:
-            crow = emp_combined.iloc[0]
-            for col in combined_extra_cols:
-                if col in crow.index:
-                    combined_extra[col] = _json_safe(crow[col])
-
-        report = {
-            "employee_id": emp_id,
-            "name": name,
-            "role": role,
-            "org": org,
-            "manager_id": manager_id,
-            "periods": periods,
-            "combined_extra": combined_extra,
-        }
-
-        report_cards.append(report)
-
-    log.info(
-        "Built %d report cards for manager_id=%s",
-        len(report_cards),
-        manager_id,
-    )
-    return report_cards
-
-
-def generate_manager_console_report(manager_id: Optional[str] = None) -> None:
-    """
-    Debug helper: prints a summary of employees under a manager
-    WITHOUT calling GPT.
-    """
-    if manager_id is None:
-        manager_id = get_current_manager_id()
-
-    reports = build_manager_reports(manager_id)
-    if not reports:
-        log.warning("No employees for manager %s", manager_id)
-        return
-
-    log.info("===== LOCAL MANAGER REPORT (NO GPT) =====")
-    for r in reports:
-        log.info(
-            "Employee: %s | Role: %s | Org: %s | Period Entries: %s",
-            r.get("employee_id"),
-            r.get("role"),
-            r.get("org"),
-            len(r.get("periods", [])),
-        )
-    log.info("=========================================")
-
-
-# ------------------------ GPT Insights ------------------------
-
-
-def _strip_code_fences(content: str) -> str:
-    """
-    Strip ```json ... ``` or ``` ... ``` fences from a model response,
-    returning only the inner JSON text.
-    """
-    cleaned = content.strip()
-
-    if cleaned.startswith("```"):
-        cleaned = cleaned[3:].lstrip()
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].lstrip()
-        fence_pos = cleaned.rfind("```")
-        if fence_pos != -1:
-            cleaned = cleaned[:fence_pos].strip()
-
-    return cleaned
-
-
-def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
-    """
-    Build structured report_cards for a given manager and call TachyonChatManager.chat_complete
-    to get JSON insights: one section per employee.
-
-    IMPORTANT:
-      - No Tachyon file upload.
-      - We send only the manager's subset of report cards in the prompt.
-      - Output format is the same as before.
-    """
-    if manager_id is None:
-        manager_id = get_current_manager_id()
-
-    log.info("Generating GPT insights for manager_id=%s", manager_id)
-
-    base_dir = Path(".")
-    output_dir = base_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Ensure full report_cards_all.json exists (for artifact) but not used by GPT directly
-    write_report_cards_all(base_dir=base_dir)
-
-    manager_reports = build_manager_reports(manager_id, base_dir=base_dir)
-    if not manager_reports:
-        log.error("No report cards found for manager_id=%s", manager_id)
-        return {"status": "error", "detail": "No report cards for manager"}
-
-    # Sort by employee_id to satisfy requirement
-    manager_reports = sorted(
-        manager_reports,
-        key=lambda r: str(r.get("employee_id") or ""),
-    )
-
-    # Encode subset as JSON string for prompt
-    reports_json = json.dumps(manager_reports, indent=2, default=str)
-
-    tcm = TachyonChatManager()
-
-    system_msg = {
-        "role": "system",
-        "content": MANAGER_INSIGHTS_SYSTEM_PROMPT,
-    }
-
-    user_content = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
-        manager_id=manager_id,
-        report_data=reports_json,
-    )
-
-    user_msg = {
-        "role": "user",
-        "content": user_content,
-    }
-
-    try:
-        log.info("Calling TachyonChatManager.chat_complete for manager_id=%s", manager_id)
-        response = tcm.chat_complete(messages=[system_msg, user_msg])
-
-        if isinstance(response, dict) and response.get("status") == "error":
-            log.error("chat_complete returned error: %s", response)
-            return response
-
-        try:
-            content = response.choices[0].message.content
-        except Exception as e:
-            log.error("Unexpected LLM response shape: %s", e)
-            return {"status": "error", "detail": "Unexpected LLM response shape"}
-
-        cleaned = _strip_code_fences(content or "")
-
-        insights_path = output_dir / f"manager_{manager_id}_insights.json"
-        raw_path = output_dir / f"manager_{manager_id}_insights_raw.txt"
-
-        try:
-            insights = json.loads(cleaned)
-            with open(insights_path, "w", encoding="utf-8") as f:
-                json.dump(insights, f, indent=2)
-            log.info("Saved insights JSON to %s", insights_path)
-            return insights
-        except json.JSONDecodeError as e:
-            log.warning("Failed to parse LLM content as JSON: %s", e)
-            with open(raw_path, "w", encoding="utf-8") as f:
-                f.write(content or "")
-            log.info("Saved raw LLM content to %s", raw_path)
-            return {"status": "ok_raw", "raw": content}
-
-    except Exception as e:
-        log.exception("Error during GPT insight generation: %s", e)
-        return {"status": "error", "detail": str(e)}
-
-
-if __name__ == "__main__":
-    mgr_id = get_current_manager_id()
-    generate_manager_console_report(manager_id=mgr_id)
-    generate_manager_gpt_insights(manager_id=mgr_id)
-
-
-
-
-
 # src/llm/prompts.py
 
 """
 Prompts for TachyonChatManager in HR Employee Insights workflow.
 
-These templates ensure:
+Ensures:
  - JSON-only structured output
- - No extra prose
  - Per-employee insight generation
  - Bias comparison (manager rating vs expected score-derived rating)
+ - Trend vs previous half
+ - Anomaly detection between H1 and H2
+ - Manager comment rewrite aligned with computed rating
+ - Future performance prediction per employee
 """
 
 MANAGER_INSIGHTS_SYSTEM_PROMPT = (
     "You are an HR performance and fairness evaluation assistant for engineering teams. "
-    "You will receive structured JSON data for a manager's direct reports, including "
-    "KPIs by period, manager ratings, and other signals. "
-    "Your job is to analyze this JSON and return unbiased, actionable insights.\n\n"
-    "Rules:\n"
-    "- Use ONLY the data provided in the JSON.\n"
-    "- Do NOT hallucinate missing information.\n"
-    "- Compare manager rating vs expected rating:\n"
-    "    aligned | manager_slightly_high | manager_very_high | manager_slightly_low | manager_very_low\n"
-    "- Provide concise summaries and development recommendations for EACH employee.\n"
-    "- Output must be valid JSON with no markdown or backticks."
+    "You receive structured JSON data for a manager's direct reports, including per-period KPIs, "
+    "manager evaluations, and derived metrics. Your job is to:\n"
+    "- Summarize performance for each employee.\n"
+    "- Compare the manager's rating to an expected rating implied by the data.\n"
+    "- Detect potential bias in the rating (too high or too low).\n"
+    "- For each half-year period (H1/H2), describe trends vs the previous period and any anomalies.\n"
+    "- Surface the original manager comment (if available) and provide a more objective rewrite aligned "
+    "with the computed rating and data.\n"
+    "- Predict likely future performance for each employee with a confidence level.\n"
+    "- Highlight risk signals and development recommendations for the employee.\n\n"
+    "You must be objective, neutral, and data-driven. "
+    "Do not hallucinate details that are not reasonably supported by the data. "
+    "Your final answer must be valid JSON only, with no extra commentary, no markdown and no backticks."
 )
 
 
@@ -500,7 +48,15 @@ MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
     "      {{\n"
     "        \"period_half\": string | null,\n"
     "        \"overall_highlights\": string,\n"
-    "        \"kpi_summary\": string\n"
+        # short, human-readable narrative of that half\n"
+    "        \"kpi_summary\": string,\n"
+        # mention key KPIs, improvements/weaknesses for that half\n"
+    "        \"trend_vs_previous\": \"improving\" | \"declining\" | \"stable\" | \"no_previous_data\",\n"
+    "        \"anomalies\": [string],\n"
+        # unusual jumps/drops or inconsistent signals between H1 and H2\n"
+    "        \"manager_comment_original\": string | null,\n"
+    "        \"manager_comment_rewrite\": string | null\n"
+        # rewritten, more objective comment consistent with data & expected rating\n"
     "      }}\n"
     "    ],\n"
     "    \"bias_assessment\": {{\n"
@@ -515,72 +71,20 @@ MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
     "      // \"manager_very_low\" |\n"
     "      // or null if not enough data.\n"
     "    }},\n"
+    "    \"future_performance\": {{\n"
+    "      \"predicted_rating\": string | null,\n"
+    "      \"confidence\": \"high\" | \"medium\" | \"low\",\n"
+    "      \"rationale\": string\n"
+    "    }},\n"
     "    \"risk_signals\": [string],\n"
     "    \"development_recommendations\": [string]\n"
     "  }}\n"
     "]\n\n"
     "Hard Requirements:\n"
-    "- Output MUST be valid JSON — no text before or after the JSON.\n"
+    "- Output MUST be valid JSON — no text before or after the JSON, no markdown fences.\n"
     "- If a field is not available, use null or an empty list as appropriate.\n"
     "- Do NOT invent roles, metrics, or ratings beyond what can be inferred from the data.\n"
+    "- If multiple half-year periods (H1/H2) exist, use them to compute trend_vs_previous and anomalies.\n"
+    "- risk_signals and development_recommendations must be focused on the EMPLOYEE (not the manager).\n"
     "- Sort employees by employee_id ascending in the output.\n"
 )
-
-
-
-
-
-# main.py
-
-from src.common.logger import get_logger
-from src.etl.etl_pipeline import run_etl
-from src.features.feature_engineering import compute_kpis
-from src.llm.generator import (
-    write_report_cards_all,
-    generate_manager_gpt_insights,
-    generate_manager_console_report,
-    get_current_manager_id,
-)
-
-log = get_logger("main")
-
-
-def main() -> None:
-    # 1) ETL
-    log.info("Step 1: Running ETL pipeline...")
-    etl_result = run_etl()
-
-    # 2) Feature engineering / KPIs
-    log.info("Step 2: Computing features / KPIs...")
-    features_combined_df, features_by_period_df = compute_kpis(etl_result)
-    log.info(
-        "Feature engineering complete: combined rows=%s, by-period rows=%s",
-        len(features_combined_df),
-        len(features_by_period_df),
-    )
-
-    # 3) Build full report_cards_all.json (artifact)
-    log.info("Step 3: Writing report_cards_all.json...")
-    write_report_cards_all()
-
-    # 4) Manager-specific insights
-    manager_id = get_current_manager_id()
-    log.info("Using manager_id=%s for insight generation", manager_id)
-
-    # Optional: debug snapshot
-    generate_manager_console_report(manager_id=manager_id)
-
-    # 5) GPT insights
-    log.info("Step 4: Generating GPT insights for manager_id=%s...", manager_id)
-    insights = generate_manager_gpt_insights(manager_id=manager_id)
-
-    if isinstance(insights, dict) and insights.get("status") in {"error", "ok_raw"}:
-        log.warning("GPT insights finished with status=%s", insights.get("status"))
-    else:
-        log.info("GPT insights generated successfully for manager_id=%s", manager_id)
-
-    log.info("Pipeline finished. Outputs are in output/ directory.")
-
-
-if __name__ == "__main__":
-    main()
