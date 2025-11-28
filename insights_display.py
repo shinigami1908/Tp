@@ -24,29 +24,36 @@ def generated_data_widget(employee_id):
             data = next((item for item in all_data if item["employee_id"] == employee_id), None)
             
         if data:
-            # Period Summaries
+            # Period Summaries & Bias Assessment
             if data.get('period_summaries'):
-                latest_summary = data['period_summaries'][0] # Taking the first one for now
-                st.markdown(f"**Overall Highlights ({latest_summary.get('period_half')}):** {latest_summary.get('overall_highlights')}")
-                st.markdown(f"**Manager Comment Rewrite:** {latest_summary.get('manager_comment_rewrite')}")
+                for summary in data['period_summaries']:
+                    with st.container(border=True):
+                        st.markdown(f"#### Period: {summary.get('period_half')}")
+                        st.markdown(f"**Overall Highlights:** {summary.get('overall_highlights')}")
+                        st.markdown(f"**Manager Comment Rewrite:** {summary.get('manager_comment_rewrite')}")
+                        
+                        # Bias Assessment (Per Period or Fallback)
+                        bias = summary.get('bias_assessment')
+                        if not bias:
+                            # Fallback to top-level if not in period (for backward compatibility)
+                            bias = data.get('bias_assessment', {})
+                        
+                        if bias:
+                            st.markdown("**Bias Assessment:**")
+                            b_col1, b_col2, b_col3 = st.columns(3)
+                            b_col1.write(f"**Manager Rating:** {bias.get('manager_rating')}")
+                            b_col2.write(f"**Expected Rating:** {bias.get('expected_rating')}")
+                            b_col3.write(f"**Comparison:** {bias.get('comparison')}")
             
             st.divider()
             
-            # Bias & Future Performance
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("#### Bias Assessment")
-                bias = data.get('bias_assessment', {})
-                st.write(f"**Manager Rating:** {bias.get('manager_rating')}")
-                st.write(f"**Expected Rating:** {bias.get('expected_rating')}")
-                st.write(f"**Comparison:** {bias.get('comparison')}")
-            
-            with col2:
-                st.markdown("#### Future Performance")
-                future = data.get('future_performance', {})
-                st.write(f"**Predicted:** {future.get('predicted_rating')}")
-                st.write(f"**Confidence:** {future.get('confidence')}")
-                st.write(f"**Rationale:** {future.get('rationale')}")
+            # Future Performance (Global)
+            st.markdown("#### Future Performance")
+            future = data.get('future_performance', {})
+            col_f1, col_f2, col_f3 = st.columns(3)
+            col_f1.write(f"**Predicted:** {future.get('predicted_rating')}")
+            col_f2.write(f"**Confidence:** {future.get('confidence')}")
+            col_f3.write(f"**Rationale:** {future.get('rationale')}")
 
             st.divider()
 
