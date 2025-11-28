@@ -3,10 +3,15 @@ import pandas as pd
 import os
 from frontend.src.computed_display import computed_data_widget
 from frontend.src.insights_display import generated_data_widget
+from frontend.src.team_display import team_data_widget
 
 def dashboard_page():
     manager_id = st.session_state.get('manager_id')
     username = st.session_state.get('username')
+    
+    # Initialize View Mode
+    if 'view_mode' not in st.session_state:
+        st.session_state['view_mode'] = "Per Employee Data"
     
     # Header
     # Custom Header Styling
@@ -71,13 +76,26 @@ def dashboard_page():
         <div class="wf-strip"></div>
     """, unsafe_allow_html=True)
 
-    # Main Title and Manager Info
-    # Using columns to layout the title and the manager box
-    col_title, col_manager = st.columns([3, 1])
+    # Main Title, View Mode, and Manager Info
+    col_title, col_spacer, col_view, col_manager = st.columns([4, 3, 2.5, 2])
     
     with col_title:
         st.markdown('<h1 class="dashboard-title">Performance Review Dashboard</h1>', unsafe_allow_html=True)
         
+    with col_view:
+        # Custom Segmented Control using Buttons
+        v_col1, v_col2 = st.columns(2)
+        with v_col1:
+            if st.button("Employee", key="btn_emp", use_container_width=True, 
+                         type="primary" if st.session_state['view_mode'] == "Per Employee Data" else "secondary"):
+                st.session_state['view_mode'] = "Per Employee Data"
+                st.rerun()
+        with v_col2:
+            if st.button("Team", key="btn_team", use_container_width=True, 
+                         type="primary" if st.session_state['view_mode'] == "Team Data" else "secondary"):
+                st.session_state['view_mode'] = "Team Data"
+                st.rerun()
+
     with col_manager:
         # Create a flex container for alignment
         c1, c2 = st.columns([2, 1])
@@ -95,49 +113,53 @@ def dashboard_page():
                 st.rerun()
 
     try:
-        # Load Employees
-        # Path to employees.csv in backend/mockdata
-        employees_path = os.path.join(os.path.dirname(__file__), '../../backend/mockdata/employees.csv')
-        df_employees = pd.read_csv(employees_path)
-        
-        # Clean whitespace from string columns
-        df_employees = df_employees.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
-        
-        # Filter by Manager ID
-        my_employees = df_employees[df_employees['manager_id'] == manager_id]
-        
-        if my_employees.empty:
-            st.warning("No employees found for this manager.")
-            return
+        if st.session_state['view_mode'] == "Per Employee Data":
+            # Load Employees
+            # Path to employees.csv in backend/mockdata
+            employees_path = os.path.join(os.path.dirname(__file__), '../../backend/mockdata/employees.csv')
+            df_employees = pd.read_csv(employees_path)
+            
+            # Clean whitespace from string columns
+            df_employees = df_employees.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+            
+            # Filter by Manager ID
+            my_employees = df_employees[df_employees['manager_id'] == manager_id]
+            
+            if my_employees.empty:
+                st.warning("No employees found for this manager.")
+                return
 
-        # Employee Selector
-        employee_options = my_employees.apply(lambda x: f"{x['name']} ({x['employee_id']})", axis=1).tolist()
-        selected_option = st.selectbox("Select Employee", employee_options)
-        
-        if selected_option:
-            selected_emp_id = selected_option.split('(')[-1].strip(' )')
-            # st.write(f"Debug: Manager ID: {manager_id}, Selected Employee ID: '{selected_emp_id}'")
-            selected_emp_data = my_employees[my_employees['employee_id'] == selected_emp_id].iloc[0]
+            # Employee Selector
+            employee_options = my_employees.apply(lambda x: f"{x['name']} ({x['employee_id']})", axis=1).tolist()
+            selected_option = st.selectbox("Select Employee", employee_options)
             
-            # Employee Details
-            with st.container(border=True):
-                st.markdown("### Employee Details")
-                col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-                col_d1.metric("Name", selected_emp_data['name'])
-                col_d2.metric("Role", selected_emp_data['role'])
-                col_d3.metric("Org", selected_emp_data['org'])
-                col_d4.metric("Employee ID", selected_emp_data['employee_id'])
-            
-            # Data Widgets
-            col_left, col_right = st.columns(2)
-            
-            with col_left:
-                with st.container(border=True):
-                    computed_data_widget(selected_emp_id)
+            if selected_option:
+                selected_emp_id = selected_option.split('(')[-1].strip(' )')
+                # st.write(f"Debug: Manager ID: {manager_id}, Selected Employee ID: '{selected_emp_id}'")
+                selected_emp_data = my_employees[my_employees['employee_id'] == selected_emp_id].iloc[0]
                 
-            with col_right:
+                # Employee Details
                 with st.container(border=True):
-                    generated_data_widget(selected_emp_id)
+                    st.markdown("### Employee Details")
+                    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+                    col_d1.metric("Name", selected_emp_data['name'])
+                    col_d2.metric("Role", selected_emp_data['role'])
+                    col_d3.metric("Org", selected_emp_data['org'])
+                    col_d4.metric("Employee ID", selected_emp_data['employee_id'])
+                
+                # Data Widgets
+                col_left, col_right = st.columns(2)
+                
+                with col_left:
+                    with st.container(border=True):
+                        computed_data_widget(selected_emp_id)
+                    
+                with col_right:
+                    with st.container(border=True):
+                        generated_data_widget(selected_emp_id)
+        else:
+            # Team Data View
+            team_data_widget(manager_id)
 
     except Exception as e:
         st.error(f"Error loading dashboard: {e}")
