@@ -1,144 +1,145 @@
-def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
+def _is_numeric_like(value: Any) -> bool:
     """
-    Generate GPT insights for a manager's direct reports.
-
-    - Builds report cards for all employees under the manager.
-    - Calls GPT *separately per employee* to avoid timeouts.
-    - Merges all per-employee insight JSON into one list.
-    - Saves final JSON to: output/manager_<manager_id>_insights.json
-    - On per-employee parse failure, writes raw response to:
-        output/manager_<manager_id>_emp_<employee_id>_raw.txt
-
-    Returns:
-        list[dict] on full/partial success, or an error dict on hard failure.
+    Helper to decide if a value is effectively numeric (int/float or numeric string).
+    We use this to drop 'raw' numeric aggregates from the GPT payload, except KPI fields.
     """
-    if manager_id is None:
-        manager_id = get_current_manager_id()
-
-    base_dir = Path(".")
-    output_dir = base_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info("Generating GPT insights (per-employee) for manager_id=%s", manager_id)
-
-    # Build structured report cards for this manager's team
-    manager_reports = build_manager_reports(manager_id, base_dir=base_dir)
-    if not manager_reports:
-        log.error("No report cards found for manager_id=%s", manager_id)
-        return {"status": "error", "detail": "No report cards for manager"}
-
-    # Sort employees by employee_id for deterministic order
-    manager_reports = sorted(
-        manager_reports,
-        key=lambda r: str(r.get("employee_id") or "")
-    )
-
-    # TachyonChatManager instance
-    tcm = TachyonChatManager()
-
-    # System message is constant across employees
-    system_msg = {
-        "role": "system",
-        "content": MANAGER_INSIGHTS_SYSTEM_PROMPT,
-    }
-
-    all_insights: List[Any] = []
-    any_success = False
-
-    for report in manager_reports:
-        emp_id = str(report.get("employee_id") or "unknown")
-        log.info("Calling GPT for employee_id=%s under manager_id=%s", emp_id, manager_id)
-
-        # Single-employee payload
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return False
         try:
-            report_json = json.dumps([report], indent=2, default=str)
-        except Exception as e:
-            log.exception("Failed to JSON-encode report for employee_id=%s: %s", emp_id, e)
+            float(s)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _compact_report_for_gpt(report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a lighter version of a single employee report for GPT:
+
+    - Keep identity / context: employee_id, name, role, org, manager_id.
+    - In `periods`:
+        * Always keep period_half.
+        * Keep ALL list/dict fields (usually text arrays, red-flag structures, etc.).
+        * Keep non-numeric scalars (strings/bools).
+        * For numeric-like fields, KEEP ONLY those whose key starts with 'kpi__'.
+    - In `combined_extra`:
+        * Same rule: keep text/bool/list/dict, plus numeric 'kpi__*' fields.
+
+    This does NOT mutate the original report; it returns a new dict.
+    """
+    core_keys = ["employee_id", "name", "role", "org", "manager_id"]
+
+    compact: Dict[str, Any] = {}
+
+    # Top-level core info
+    for k in core_keys:
+        if k in report:
+            compact[k] = report[k]
+
+    # Periods
+    compact_periods: List[Dict[str, Any]] = []
+    for period in report.get("periods", []) or []:
+        new_p: Dict[str, Any] = {}
+        for key, val in period.items():
+            # Ignore any stray employee_id inside period rows
+            if key == "employee_id":
+                continue
+
+            # Always keep the period identifier
+            if key in ("period_half", "period", "period_label"):
+                new_p[key] = val
+                continue
+
+            # Preserve lists/dicts – these are often structured text or red-flag info
+            if isinstance(val, (list, dict)):
+                new_p[key] = val
+                continue
+
+            # Numeric-like?
+            if _is_numeric_like(val):
+                # Only keep numeric KPI-style fields
+                if isinstance(key, str) and key.startswith("kpi__"):
+                    new_p[key] = val
+                # else: drop raw aggregates from GPT payload
+                continue
+
+            # Non-numeric scalar (string/bool/etc.) → keep
+            new_p[key] = val
+
+        if new_p:
+            compact_periods.append(new_p)
+
+    compact["periods"] = compact_periods
+
+    # combined_extra
+    combined_extra = report.get("combined_extra", {}) or {}
+    new_combined: Dict[str, Any] = {}
+
+    for key, val in combined_extra.items():
+        # Preserve lists/dicts
+        if isinstance(val, (list, dict)):
+            new_combined[key] = val
             continue
 
-        # Build user message
-        user_content = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
-            manager_id=manager_id,
-            report_data=report_json,
-        )
-        user_msg = {
-            "role": "user",
-            "content": user_content,
-        }
-
-        try:
-            response = tcm.chat_complete(messages=[system_msg, user_msg])
-
-            # Handle error-style dict from chat_complete
-            if isinstance(response, dict) and response.get("status") == "error":
-                log.error("chat_complete error for employee_id=%s: %s", emp_id, response)
-                continue
-
-            # Extract text content
-            try:
-                content = response.choices[0].message.content
-            except Exception as e:
-                log.error("Unexpected LLM response shape for employee_id=%s: %s", emp_id, e)
-                continue
-
-            cleaned = _strip_code_fences(content or "")
-
-            # Try to parse JSON
-            try:
-                emp_insights = json.loads(cleaned)
-                any_success = True
-
-                # Allow model to return either a single object or a list
-                if isinstance(emp_insights, list):
-                    all_insights.extend(emp_insights)
-                elif isinstance(emp_insights, dict):
-                    all_insights.append(emp_insights)
-                else:
-                    log.warning(
-                        "Parsed JSON for employee_id=%s is neither list nor dict; skipping",
-                        emp_id,
-                    )
-
-            except json.JSONDecodeError as e:
-                log.warning(
-                    "Failed to parse LLM JSON for employee_id=%s: %s. Saving raw.",
-                    emp_id,
-                    e,
-                )
-                raw_path = output_dir / f"manager_{manager_id}_emp_{emp_id}_raw.txt"
-                try:
-                    with open(raw_path, "w", encoding="utf-8") as f:
-                        f.write(content or "")
-                    log.info("Saved raw LLM content for employee_id=%s to %s", emp_id, raw_path)
-                except Exception as write_err:
-                    log.warning(
-                        "Could not write raw LLM content for employee_id=%s: %s",
-                        emp_id,
-                        write_err,
-                    )
-                # Move on to next employee
-                continue
-
-        except Exception as e:
-            log.exception("Error during GPT call for employee_id=%s: %s", emp_id, e)
+        # Numeric-like?
+        if _is_numeric_like(val):
+            if isinstance(key, str) and key.startswith("kpi__"):
+                new_combined[key] = val
             continue
 
-    # If nothing parsed successfully, return an error status
-    if not any_success:
-        log.error(
-            "No successful GPT insights generated for manager_id=%s; see logs/raw files.",
-            manager_id,
-        )
-        return {"status": "error", "detail": "No successful GPT results"}
+        # Non-numeric scalar
+        new_combined[key] = val
 
-    # Save merged insights
-    insights_path = output_dir / f"manager_{manager_id}_insights.json"
-    try:
-        with open(insights_path, "w", encoding="utf-8") as f:
-            json.dump(all_insights, f, indent=2)
-        log.info("Saved merged insights JSON to %s", insights_path)
-    except Exception as e:
-        log.exception("Failed to write merged insights file: %s", e)
-        return {"status": "error", "detail": "Failed to write insights file"}
+    compact["combined_extra"] = new_combined
 
-    return all_insights
+    return compact
+
+
+def _build_compact_reports_for_gpt(reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build a compact version of all reports for GPT by applying _compact_report_for_gpt
+    to each full report.
+    """
+    return [_compact_report_for_gpt(r) for r in reports]
+
+
+
+
+manager_reports = build_manager_reports(manager_id, base_dir=base_dir)
+if not manager_reports:
+    log.error("No report cards found for manager_id=%s", manager_id)
+    return {"status": "error", "detail": "No report cards for manager"}
+
+# Sort by employee_id for deterministic order
+manager_reports = sorted(
+    manager_reports,
+    key=lambda r: str(r.get("employee_id") or "")
+)
+
+# 🔴 NEW: build compact copy for GPT payload
+compact_reports = _build_compact_reports_for_gpt(manager_reports)
+
+# Only the compact version goes in the prompt
+reports_json = json.dumps(compact_reports, indent=2, default=str)
+
+tcm = TachyonChatManager()
+
+system_msg = {
+    "role": "system",
+    "content": MANAGER_INSIGHTS_SYSTEM_PROMPT,
+}
+
+user_content = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
+    manager_id=manager_id,
+    report_data=reports_json,
+)
+
+user_msg = {
+    "role": "user",
+    "content": user_content,
+}
