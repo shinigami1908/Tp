@@ -1,90 +1,167 @@
-MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
-    "Manager ID: {manager_id}\n\n"
-    "Below is 'report_data_compact', which is a JSON array containing compressed "
-    "performance data for all direct-report employees of this manager.\n"
-    "This compact format is token-efficient but contains all essential information needed "
-    "to generate insights.\n\n"
-    "### Input Key Mapping (IMPORTANT — refer to this when interpreting data)\n"
-    "- e  = employee_id\n"
-    "- n  = name\n"
-    "- rl = role\n"
-    "- org = organization/team\n"
-    "- p  = list of period objects (typically H1 & H2)\n"
-    "Inside each period object:\n"
-    "  - ph = period_half (ex: '2025H1', '2025H2')\n"
-    "  - mr = manager_rating (text rating like 'Meets', 'Exceeds')\n"
-    "  - er = expected_rating (derived from KPIs)\n"
-    "  - rv = rating variance vs expected:\n"
-    "         A = aligned\n"
-    "         SL = slightly low\n"
-    "         VL = very low\n"
-    "         SH = slightly high\n"
-    "         VH = very high\n"
-    "\n"
-    "  // KPI short codes:\n"
-    "  - k1 = story point completion ratio\n"
-    "  - k2 = defect escape rate\n"
-    "  - k3 = RTO compliance rate\n"
-    "  - k4 = copilot accept ratio\n"
-    "  - k5 = overdue IDP goals count\n"
-    "\n"
-    "  // Performance movement indicators:\n"
-    "  - tr = performance trend vs previous period:\n"
-    "         UP = improving\n"
-    "         DN = declining\n"
-    "         ST = stable\n"
-    "\n"
-    "  - an = list of anomaly signals (short labels)\n"
-    "        ex: 'FP↓' = drop in future potential, 'QC↑' = quality spike, etc.\n\n"
-    "- mco = combined original manager comment(s)\n"
-    "- fp  = predicted future KPI trend (UP/DN/ST)\n"
-    "- pr  = future predicted rating (Exceeds/Meets/Below/Uncertain)\n"
-    "- ra  = short rationale for prediction\n\n"
-    "----------------------------------------------\n\n"
-    "Here is the actual JSON compact data:\n\n"
-    "===== REPORT DATA COMPACT BEGIN =====\n"
-    "{report_data}\n"
-    "===== REPORT DATA COMPACT END =====\n\n"
-    "----------------------------------------------\n\n"
-    "### REQUIRED OUTPUT FORMAT (STRICT)\n"
-    "Return ONLY a JSON ARRAY.\n"
-    "Each element must follow this EXACT structure:\n\n"
-    "[\n"
-    "  {{\n"
-    "    \"employee_id\": string,\n"
-    "    \"name\": string | null,\n"
-    "    \"period_summaries\": [\n"
-    "      {{\n"
-    "        \"period_half\": string | null,\n"
-    "        \"overall_highlights\": string,\n"
-    "        \"kpi_summary\": string,\n"
-    "        \"trend_vs_previous\": \"improving\" | \"declining\" | \"stable\" | \"no_previous_data\",\n"
-    "        \"anomalies\": [string],\n"
-    "        \"manager_comment_original\": string | null,\n"
-    "        \"manager_comment_rewrite\": string | null\n"
-    "      }}\n"
-    "    ],\n"
-    "    \"bias_assessment\": {{\n"
-    "      \"manager_rating\": string | null,\n"
-    "      \"expected_rating\": string | null,\n"
-    "      \"comparison\": \"aligned\" | \"manager_slightly_high\" | \"manager_very_high\" | \"manager_slightly_low\" | \"manager_very_low\" | null\n"
-    "    }},\n"
-    "    \"future_performance\": {{\n"
-    "      \"predicted_rating\": string | null,\n"
-    "      \"confidence\": \"high\" | \"medium\" | \"low\",\n"
-    "      \"rationale\": string\n"
-    "    }},\n"
-    "    \"risk_signals\": [string],\n"
-    "    \"development_recommendations\": [string]\n"
-    "  }}\n"
-    "]\n\n"
-    "----------------------------------------------\n"
-    "RULES:\n"
-    "- Do NOT add markdown, comments, or explanation outside raw JSON\n"
-    "- Sort employees by employee_id\n"
-    "- Never hallucinate missing data — use null if not available\n"
-    "- All conclusions must be based on the provided compact KPIs\n"
+# --- NEW: parse combined team_overview + employee_insights ---
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            log.warning("Failed to parse LLM content as JSON: %s", e)
+            raw_path = output_dir / f"manager_{manager_id}_insights_raw.txt"
+            with open(raw_path, "w", encoding="utf-8") as f:
+                f.write(content or "")
+            log.info("Saved raw LLM content to %s", raw_path)
+            return {"status": "ok_raw", "raw": content}
+
+        team_overview = None
+        employee_insights: List[Any] = []
+
+        # Preferred new structure: {"team_overview": {...}, "employee_insights": [...]}
+        if isinstance(data, dict) and "employee_insights" in data:
+            team_overview = data.get("team_overview")
+            employee_insights = data.get("employee_insights") or []
+        # Backward-compatible: model returned just a list of employees
+        elif isinstance(data, list):
+            employee_insights = data
+        else:
+            log.error(
+                "Unexpected JSON structure from LLM. Expected "
+                "{'team_overview': ..., 'employee_insights': [...] } or a list. Got: %s",
+                type(data),
+            )
+            return {"status": "error", "detail": "Unexpected JSON structure from LLM"}
+
+        # Save per-employee insights (same semantics as before)
+        insights_path = output_dir / f"manager_{manager_id}_insights.json"
+        with open(insights_path, "w", encoding="utf-8") as f:
+            json.dump(employee_insights, f, indent=2)
+        log.info("Saved per-employee insights JSON to %s", insights_path)
+
+        # Save team overview if present
+        if team_overview is not None:
+            overview_path = output_dir / f"manager_{manager_id}_overall_insights.json"
+            with open(overview_path, "w", encoding="utf-8") as f:
+                json.dump(team_overview, f, indent=2)
+            log.info("Saved manager team overview JSON to %s", overview_path)
+
+        return employee_insights
+
+    except Exception as e:
+        log.exception("Error during GPT insight generation: %s", e)
+        return {"status": "error", "detail": str(e)}
+
+
+
+
+
+# src/llm/prompts.py
+
+MANAGER_INSIGHTS_SYSTEM_PROMPT = (
+    "You are an HR performance and fairness evaluation assistant for engineering teams. "
+    "You receive structured, compact JSON data for a manager's direct reports. "
+    "Each JSON object describes one employee and contains:\n"
+    "- Identity (employee_id, name, role, org, manager_id).\n"
+    "- A list of per-period records (typically half-year, e.g. 2025H1, 2025H2) with KPIs and text signals.\n"
+    "- Aggregate fields across all periods for the employee.\n\n"
+    "Your tasks are:\n"
+    "1) For each employee: summarize performance per period, use KPIs to describe delivery, quality, RTO, learning, "
+    "   and other signals, compare manager rating vs expected rating, detect trends and anomalies between periods, "
+    "   rewrite manager comments more objectively, and predict future performance with confidence and rationale.\n"
+    "2) At the team level: produce an executive overview for the manager that summarizes how the whole team is doing, "
+    "   including key strengths, areas for improvement, and strategic recommendations.\n\n"
+    "You must be objective, neutral, and data-driven. Use only information that is reasonably supported by the input. "
+    "Do NOT hallucinate specific incidents or exact numeric values that are not implied. "
+    "Your final answer must be strictly valid JSON only, with no markdown, no code fences, and no extra commentary "
+    "outside the JSON."
 )
 
 
 
+MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
+    "Manager ID: {manager_id}\n\n"
+    "You are given 'report_data_compact', a JSON array of compact performance records for this manager's "
+    "direct reports. Each element in this array corresponds to ONE employee.\n\n"
+    "### INPUT STRUCTURE (report_data_compact)\n"
+    "Each employee object generally has:\n"
+    "- \"employee_id\": string\n"
+    "- \"name\": string or null\n"
+    "- \"role\": string or null\n"
+    "- \"org\": string or null\n"
+    "- \"manager_id\": string or null\n"
+    "- \"periods\": [ ... ]  // list of per-period records for that employee\n"
+    "- \"combined_extra\": {{ ... }}  // aggregated metrics and text across all periods\n\n"
+    "Inside each element of \"periods\":\n"
+    "- \"period_half\": string or null (e.g., '2025H1', '2025H2').\n"
+    "- Various numeric KPI fields whose names typically START WITH \"kpi__\". These are pre-computed metrics derived "
+    "  from the raw data (e.g., story point completion ratios, defect escape rates, RTO compliance, copilot usage, "
+    "  IDP goal completion, recognition counts, etc.). You should treat these \"kpi__*\" fields as the primary "
+    "  numeric signals for performance.\n"
+    "- Other non-numeric fields (strings, lists, dictionaries) representing things like feedback summaries, "
+    "  recognition notes, workday check-in summaries, manager comments, or derived flags.\n"
+    "- Raw numeric aggregates that do NOT start with \"kpi__\" have been removed from this compact view.\n\n"
+    "Inside \"combined_extra\":\n"
+    "- Similar convention: any field whose name starts with \"kpi__\" is an aggregated KPI across all periods for "
+    "  that employee (e.g., total or overall rates). Other text fields may contain concatenated comments or summaries.\n\n"
+    "---------------- COMPACT DATA BEGIN ----------------\n"
+    "{report_data}\n"
+    "---------------- COMPACT DATA END ----------------\n\n"
+    "Using ONLY this data, produce a SINGLE JSON object with TWO top-level keys:\n\n"
+    "{{\n"
+    "  \"team_overview\": {{\n"
+    "    \"manager_id\": string,\n"
+    "    \"generated_at\": string,  // ISO-8601 timestamp or reasonable approximation\n"
+    "    \"executive_summary\": string,\n"
+    "    \"key_strengths\": [string],\n"
+    "    \"areas_for_improvement\": [string],\n"
+    "    \"strategic_recommendations\": [string]\n"
+    "  }},\n"
+    "  \"employee_insights\": [\n"
+    "    {{\n"
+    "      \"employee_id\": string,\n"
+    "      \"name\": string | null,\n"
+    "      \"period_summaries\": [\n"
+    "        {{\n"
+    "          \"period_half\": string | null,\n"
+    "          \"overall_highlights\": string,\n"
+    "          \"kpi_summary\": string,\n"
+    "          \"trend_vs_previous\": \"improving\" | \"declining\" | \"stable\" | \"no_previous_data\",\n"
+    "          \"anomalies\": [string],\n"
+    "          \"manager_comment_original\": string | null,\n"
+    "          \"manager_comment_rewrite\": string | null\n"
+    "        }}\n"
+    "      ],\n"
+    "      \"bias_assessment\": {{\n"
+    "        \"manager_rating\": string | null,\n"
+    "        \"expected_rating\": string | null,\n"
+    "        \"comparison\": \"aligned\" | \"manager_slightly_high\" | \"manager_very_high\" | "
+    "\"manager_slightly_low\" | \"manager_very_low\" | null\n"
+    "      }},\n"
+    "      \"future_performance\": {{\n"
+    "        \"predicted_rating\": string | null,\n"
+    "        \"confidence\": \"high\" | \"medium\" | \"low\",\n"
+    "        \"rationale\": string\n"
+    "      }},\n"
+    "      \"risk_signals\": [string],\n"
+    "      \"development_recommendations\": [string]\n"
+    "    }}\n"
+    "  ]\n"
+    "}}\n\n"
+    "GUIDANCE:\n"
+    "- For each employee, use the per-period \"kpi__*\" fields and any available text (feedback, recognition, "
+    "  manager comments) to infer performance in that half-year.\n"
+    "- \"trend_vs_previous\" for a period compares that period to the immediately previous one for the SAME employee:\n"
+    "    * \"improving\": overall KPIs and signals are better than previous.\n"
+    "    * \"declining\": overall KPIs and signals are worse than previous.\n"
+    "    * \"stable\": roughly similar levels.\n"
+    "    * \"no_previous_data\": use for the earliest period.\n"
+    "- \"anomalies\" should list notable unusual changes (e.g., sudden large drop in completion ratio, spike in defects,\n"
+    "  drastic change in recognition or sentiment). Use short, clear phrases.\n"
+    "- \"manager_comment_original\" should reflect the manager's own comment for that period, if it can be identified "
+    "  from the text fields; if missing, use null.\n"
+    "- \"manager_comment_rewrite\" should be a clearer, more objective and data-aligned version of that comment.\n"
+    "- \"bias_assessment\" compares manager_rating vs expected_rating derived from KPIs and other signals.\n"
+    "- \"future_performance\" predicts likely rating in the next half-year based on trends and consistency.\n"
+    "- \"risk_signals\" and \"development_recommendations\" must be focused on the EMPLOYEE, not judging the manager.\n\n"
+    "STRICT REQUIREMENTS:\n"
+    "- Output MUST be valid JSON with exactly this structure: an object with 'team_overview' and 'employee_insights'.\n"
+    "- Do NOT return a top-level array; wrap it as shown above.\n"
+    "- Do NOT include markdown or code fences, only raw JSON.\n"
+    "- If a field is not available, use null or an empty list as appropriate.\n"
+    "- Every employee from report_data_compact must appear exactly once in employee_insights, sorted by employee_id.\n"
+)
