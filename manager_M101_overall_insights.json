@@ -1,0 +1,20 @@
+{
+    "manager_id": "M101",
+    "generated_at": "2023-10-27T10:00:00Z",
+    "executive_summary": "Team performance is stable but velocity has plateaued. Quality metrics are excellent with very low defect escape rates. There is an opportunity to increase throughput by adopting more automation tools.",
+    "key_strengths": [
+        "Exceptional code quality and low bug rates.",
+        "High team morale and low turnover.",
+        "Excellent documentation practices."
+    ],
+    "areas_for_improvement": [
+        "Velocity is below the department average.",
+        "Adoption of new tools (like Copilot) is lagging.",
+        "Cross-training is needed to reduce key-person dependencies."
+    ],
+    "strategic_recommendations": [
+        "Set targets for incremental velocity improvement.",
+        "Incentivize usage of AI coding assistants.",
+        "Rotate responsibilities in the next sprint to foster knowledge sharing."
+    ]
+}
