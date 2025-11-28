@@ -1,27 +1,144 @@
-def generate_manager_gpt_insights(manager_id: str):
-    reports = build_manager_reports(manager_id)
+def generate_manager_gpt_insights(manager_id: Optional[str] = None) -> Any:
+    """
+    Generate GPT insights for a manager's direct reports.
 
-    final_results = []
+    - Builds report cards for all employees under the manager.
+    - Calls GPT *separately per employee* to avoid timeouts.
+    - Merges all per-employee insight JSON into one list.
+    - Saves final JSON to: output/manager_<manager_id>_insights.json
+    - On per-employee parse failure, writes raw response to:
+        output/manager_<manager_id>_emp_<employee_id>_raw.txt
 
-    for employee_report in reports:
-        report_json = json.dumps([employee_report])  # only 1 employee
-        prompt = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
+    Returns:
+        list[dict] on full/partial success, or an error dict on hard failure.
+    """
+    if manager_id is None:
+        manager_id = get_current_manager_id()
+
+    base_dir = Path(".")
+    output_dir = base_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log.info("Generating GPT insights (per-employee) for manager_id=%s", manager_id)
+
+    # Build structured report cards for this manager's team
+    manager_reports = build_manager_reports(manager_id, base_dir=base_dir)
+    if not manager_reports:
+        log.error("No report cards found for manager_id=%s", manager_id)
+        return {"status": "error", "detail": "No report cards for manager"}
+
+    # Sort employees by employee_id for deterministic order
+    manager_reports = sorted(
+        manager_reports,
+        key=lambda r: str(r.get("employee_id") or "")
+    )
+
+    # TachyonChatManager instance
+    tcm = TachyonChatManager()
+
+    # System message is constant across employees
+    system_msg = {
+        "role": "system",
+        "content": MANAGER_INSIGHTS_SYSTEM_PROMPT,
+    }
+
+    all_insights: List[Any] = []
+    any_success = False
+
+    for report in manager_reports:
+        emp_id = str(report.get("employee_id") or "unknown")
+        log.info("Calling GPT for employee_id=%s under manager_id=%s", emp_id, manager_id)
+
+        # Single-employee payload
+        try:
+            report_json = json.dumps([report], indent=2, default=str)
+        except Exception as e:
+            log.exception("Failed to JSON-encode report for employee_id=%s: %s", emp_id, e)
+            continue
+
+        # Build user message
+        user_content = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
             manager_id=manager_id,
-            report_data=report_json
+            report_data=report_json,
         )
-        
-        messages = [
-            {"role": "system", "content": MANAGER_INSIGHTS_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ]
+        user_msg = {
+            "role": "user",
+            "content": user_content,
+        }
 
-        response = chat_mgr.chat_complete(messages)
-        cleaned = _extract_json_from_response(response)
-        final_results.extend(cleaned)
+        try:
+            response = tcm.chat_complete(messages=[system_msg, user_msg])
 
-    # save combined insights
-    output_path = os.path.join(OUTPUT_DIR, f"manager_{manager_id}_insights.json")
-    with open(output_path, "w") as f:
-        json.dump(final_results, f, indent=2)
+            # Handle error-style dict from chat_complete
+            if isinstance(response, dict) and response.get("status") == "error":
+                log.error("chat_complete error for employee_id=%s: %s", emp_id, response)
+                continue
 
-    return final_results
+            # Extract text content
+            try:
+                content = response.choices[0].message.content
+            except Exception as e:
+                log.error("Unexpected LLM response shape for employee_id=%s: %s", emp_id, e)
+                continue
+
+            cleaned = _strip_code_fences(content or "")
+
+            # Try to parse JSON
+            try:
+                emp_insights = json.loads(cleaned)
+                any_success = True
+
+                # Allow model to return either a single object or a list
+                if isinstance(emp_insights, list):
+                    all_insights.extend(emp_insights)
+                elif isinstance(emp_insights, dict):
+                    all_insights.append(emp_insights)
+                else:
+                    log.warning(
+                        "Parsed JSON for employee_id=%s is neither list nor dict; skipping",
+                        emp_id,
+                    )
+
+            except json.JSONDecodeError as e:
+                log.warning(
+                    "Failed to parse LLM JSON for employee_id=%s: %s. Saving raw.",
+                    emp_id,
+                    e,
+                )
+                raw_path = output_dir / f"manager_{manager_id}_emp_{emp_id}_raw.txt"
+                try:
+                    with open(raw_path, "w", encoding="utf-8") as f:
+                        f.write(content or "")
+                    log.info("Saved raw LLM content for employee_id=%s to %s", emp_id, raw_path)
+                except Exception as write_err:
+                    log.warning(
+                        "Could not write raw LLM content for employee_id=%s: %s",
+                        emp_id,
+                        write_err,
+                    )
+                # Move on to next employee
+                continue
+
+        except Exception as e:
+            log.exception("Error during GPT call for employee_id=%s: %s", emp_id, e)
+            continue
+
+    # If nothing parsed successfully, return an error status
+    if not any_success:
+        log.error(
+            "No successful GPT insights generated for manager_id=%s; see logs/raw files.",
+            manager_id,
+        )
+        return {"status": "error", "detail": "No successful GPT results"}
+
+    # Save merged insights
+    insights_path = output_dir / f"manager_{manager_id}_insights.json"
+    try:
+        with open(insights_path, "w", encoding="utf-8") as f:
+            json.dump(all_insights, f, indent=2)
+        log.info("Saved merged insights JSON to %s", insights_path)
+    except Exception as e:
+        log.exception("Failed to write merged insights file: %s", e)
+        return {"status": "error", "detail": "Failed to write insights file"}
+
+    return all_insights
