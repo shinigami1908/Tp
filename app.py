@@ -55,16 +55,6 @@ st.markdown(f"""
             font-size: 14px;
             z-index: 999;
         }}
-        .stButton>button {{
-            background-color: {WF_RED};
-            color: white;
-            border-radius: 5px;
-            border: none;
-        }}
-        .stButton>button:hover {{
-            background-color: #b31921;
-            color: white;
-        }}
         .box {{
             background-color: white;
             padding: 20px;
