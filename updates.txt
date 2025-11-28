@@ -1,90 +1,27 @@
-# src/llm/prompts.py
+def generate_manager_gpt_insights(manager_id: str):
+    reports = build_manager_reports(manager_id)
 
-"""
-Prompts for TachyonChatManager in HR Employee Insights workflow.
+    final_results = []
 
-Ensures:
- - JSON-only structured output
- - Per-employee insight generation
- - Bias comparison (manager rating vs expected score-derived rating)
- - Trend vs previous half
- - Anomaly detection between H1 and H2
- - Manager comment rewrite aligned with computed rating
- - Future performance prediction per employee
-"""
+    for employee_report in reports:
+        report_json = json.dumps([employee_report])  # only 1 employee
+        prompt = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
+            manager_id=manager_id,
+            report_data=report_json
+        )
+        
+        messages = [
+            {"role": "system", "content": MANAGER_INSIGHTS_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
 
-MANAGER_INSIGHTS_SYSTEM_PROMPT = (
-    "You are an HR performance and fairness evaluation assistant for engineering teams. "
-    "You receive structured JSON data for a manager's direct reports, including per-period KPIs, "
-    "manager evaluations, and derived metrics. Your job is to:\n"
-    "- Summarize performance for each employee.\n"
-    "- Compare the manager's rating to an expected rating implied by the data.\n"
-    "- Detect potential bias in the rating (too high or too low).\n"
-    "- For each half-year period (H1/H2), describe trends vs the previous period and any anomalies.\n"
-    "- Surface the original manager comment (if available) and provide a more objective rewrite aligned "
-    "with the computed rating and data.\n"
-    "- Predict likely future performance for each employee with a confidence level.\n"
-    "- Highlight risk signals and development recommendations for the employee.\n\n"
-    "You must be objective, neutral, and data-driven. "
-    "Do not hallucinate details that are not reasonably supported by the data. "
-    "Your final answer must be valid JSON only, with no extra commentary, no markdown and no backticks."
-)
+        response = chat_mgr.chat_complete(messages)
+        cleaned = _extract_json_from_response(response)
+        final_results.extend(cleaned)
 
+    # save combined insights
+    output_path = os.path.join(OUTPUT_DIR, f"manager_{manager_id}_insights.json")
+    with open(output_path, "w") as f:
+        json.dump(final_results, f, indent=2)
 
-MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
-    "Manager ID: {manager_id}\n\n"
-    "Below is the JSON-encoded report card data for this manager's direct reports. "
-    "Each element corresponds to one employee and contains per-period KPIs and combined metrics.\n\n"
-    "---------------- REPORT DATA BEGIN ----------------\n"
-    "{report_data}\n"
-    "---------------- REPORT DATA END ----------------\n\n"
-    "Using ONLY the data above, produce insights in the following JSON shape.\n\n"
-    "Respond ONLY with a JSON array, where each element has this structure:\n\n"
-    "[\n"
-    "  {{\n"
-    "    \"employee_id\": string,\n"
-    "    \"name\": string | null,\n"
-    "    \"period_summaries\": [\n"
-    "      {{\n"
-    "        \"period_half\": string | null,\n"
-    "        \"overall_highlights\": string,\n"
-        # short, human-readable narrative of that half\n"
-    "        \"kpi_summary\": string,\n"
-        # mention key KPIs, improvements/weaknesses for that half\n"
-    "        \"trend_vs_previous\": \"improving\" | \"declining\" | \"stable\" | \"no_previous_data\",\n"
-    "        \"anomalies\": [string],\n"
-        # unusual jumps/drops or inconsistent signals between H1 and H2\n"
-    "        \"manager_comment_original\": string | null,\n"
-    "        \"manager_comment_rewrite\": string | null\n"
-        # rewritten, more objective comment consistent with data & expected rating\n"
-    "      }}\n"
-    "    ],\n"
-    "    \"bias_assessment\": {{\n"
-    "      \"manager_rating\": string | null,\n"
-    "      \"expected_rating\": string | null,\n"
-    "      \"comparison\": string | null\n"
-    "      // Allowed comparison values:\n"
-    "      // \"aligned\" |\n"
-    "      // \"manager_slightly_high\" |\n"
-    "      // \"manager_very_high\" |\n"
-    "      // \"manager_slightly_low\" |\n"
-    "      // \"manager_very_low\" |\n"
-    "      // or null if not enough data.\n"
-    "    }},\n"
-    "    \"future_performance\": {{\n"
-    "      \"predicted_rating\": string | null,\n"
-    "      \"confidence\": \"high\" | \"medium\" | \"low\",\n"
-    "      \"rationale\": string\n"
-    "    }},\n"
-    "    \"risk_signals\": [string],\n"
-    "    \"development_recommendations\": [string]\n"
-    "  }}\n"
-    "]\n\n"
-    "Hard Requirements:\n"
-    "- Output MUST be valid JSON — no text before or after the JSON, no markdown fences.\n"
-    "- If a field is not available, use null or an empty list as appropriate.\n"
-    "- Do NOT invent roles, metrics, or ratings beyond what can be inferred from the data.\n"
-    "- If multiple half-year periods (H1/H2) exist, use them to compute trend_vs_previous and anomalies.\n"
-    "- risk_signals and development_recommendations must be focused on the EMPLOYEE (not the manager).\n"
-    "- Sort employees by employee_id ascending in the output.\n"
-)
+    return final_results
