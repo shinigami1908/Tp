@@ -1,145 +1,90 @@
-def _is_numeric_like(value: Any) -> bool:
-    """
-    Helper to decide if a value is effectively numeric (int/float or numeric string).
-    We use this to drop 'raw' numeric aggregates from the GPT payload, except KPI fields.
-    """
-    if isinstance(value, (int, float)):
-        return True
-    if isinstance(value, str):
-        s = value.strip()
-        if s == "":
-            return False
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-    return False
-
-
-def _compact_report_for_gpt(report: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build a lighter version of a single employee report for GPT:
-
-    - Keep identity / context: employee_id, name, role, org, manager_id.
-    - In `periods`:
-        * Always keep period_half.
-        * Keep ALL list/dict fields (usually text arrays, red-flag structures, etc.).
-        * Keep non-numeric scalars (strings/bools).
-        * For numeric-like fields, KEEP ONLY those whose key starts with 'kpi__'.
-    - In `combined_extra`:
-        * Same rule: keep text/bool/list/dict, plus numeric 'kpi__*' fields.
-
-    This does NOT mutate the original report; it returns a new dict.
-    """
-    core_keys = ["employee_id", "name", "role", "org", "manager_id"]
-
-    compact: Dict[str, Any] = {}
-
-    # Top-level core info
-    for k in core_keys:
-        if k in report:
-            compact[k] = report[k]
-
-    # Periods
-    compact_periods: List[Dict[str, Any]] = []
-    for period in report.get("periods", []) or []:
-        new_p: Dict[str, Any] = {}
-        for key, val in period.items():
-            # Ignore any stray employee_id inside period rows
-            if key == "employee_id":
-                continue
-
-            # Always keep the period identifier
-            if key in ("period_half", "period", "period_label"):
-                new_p[key] = val
-                continue
-
-            # Preserve lists/dicts – these are often structured text or red-flag info
-            if isinstance(val, (list, dict)):
-                new_p[key] = val
-                continue
-
-            # Numeric-like?
-            if _is_numeric_like(val):
-                # Only keep numeric KPI-style fields
-                if isinstance(key, str) and key.startswith("kpi__"):
-                    new_p[key] = val
-                # else: drop raw aggregates from GPT payload
-                continue
-
-            # Non-numeric scalar (string/bool/etc.) → keep
-            new_p[key] = val
-
-        if new_p:
-            compact_periods.append(new_p)
-
-    compact["periods"] = compact_periods
-
-    # combined_extra
-    combined_extra = report.get("combined_extra", {}) or {}
-    new_combined: Dict[str, Any] = {}
-
-    for key, val in combined_extra.items():
-        # Preserve lists/dicts
-        if isinstance(val, (list, dict)):
-            new_combined[key] = val
-            continue
-
-        # Numeric-like?
-        if _is_numeric_like(val):
-            if isinstance(key, str) and key.startswith("kpi__"):
-                new_combined[key] = val
-            continue
-
-        # Non-numeric scalar
-        new_combined[key] = val
-
-    compact["combined_extra"] = new_combined
-
-    return compact
-
-
-def _build_compact_reports_for_gpt(reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Build a compact version of all reports for GPT by applying _compact_report_for_gpt
-    to each full report.
-    """
-    return [_compact_report_for_gpt(r) for r in reports]
-
-
-
-
-manager_reports = build_manager_reports(manager_id, base_dir=base_dir)
-if not manager_reports:
-    log.error("No report cards found for manager_id=%s", manager_id)
-    return {"status": "error", "detail": "No report cards for manager"}
-
-# Sort by employee_id for deterministic order
-manager_reports = sorted(
-    manager_reports,
-    key=lambda r: str(r.get("employee_id") or "")
+MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE = (
+    "Manager ID: {manager_id}\n\n"
+    "Below is 'report_data_compact', which is a JSON array containing compressed "
+    "performance data for all direct-report employees of this manager.\n"
+    "This compact format is token-efficient but contains all essential information needed "
+    "to generate insights.\n\n"
+    "### Input Key Mapping (IMPORTANT — refer to this when interpreting data)\n"
+    "- e  = employee_id\n"
+    "- n  = name\n"
+    "- rl = role\n"
+    "- org = organization/team\n"
+    "- p  = list of period objects (typically H1 & H2)\n"
+    "Inside each period object:\n"
+    "  - ph = period_half (ex: '2025H1', '2025H2')\n"
+    "  - mr = manager_rating (text rating like 'Meets', 'Exceeds')\n"
+    "  - er = expected_rating (derived from KPIs)\n"
+    "  - rv = rating variance vs expected:\n"
+    "         A = aligned\n"
+    "         SL = slightly low\n"
+    "         VL = very low\n"
+    "         SH = slightly high\n"
+    "         VH = very high\n"
+    "\n"
+    "  // KPI short codes:\n"
+    "  - k1 = story point completion ratio\n"
+    "  - k2 = defect escape rate\n"
+    "  - k3 = RTO compliance rate\n"
+    "  - k4 = copilot accept ratio\n"
+    "  - k5 = overdue IDP goals count\n"
+    "\n"
+    "  // Performance movement indicators:\n"
+    "  - tr = performance trend vs previous period:\n"
+    "         UP = improving\n"
+    "         DN = declining\n"
+    "         ST = stable\n"
+    "\n"
+    "  - an = list of anomaly signals (short labels)\n"
+    "        ex: 'FP↓' = drop in future potential, 'QC↑' = quality spike, etc.\n\n"
+    "- mco = combined original manager comment(s)\n"
+    "- fp  = predicted future KPI trend (UP/DN/ST)\n"
+    "- pr  = future predicted rating (Exceeds/Meets/Below/Uncertain)\n"
+    "- ra  = short rationale for prediction\n\n"
+    "----------------------------------------------\n\n"
+    "Here is the actual JSON compact data:\n\n"
+    "===== REPORT DATA COMPACT BEGIN =====\n"
+    "{report_data}\n"
+    "===== REPORT DATA COMPACT END =====\n\n"
+    "----------------------------------------------\n\n"
+    "### REQUIRED OUTPUT FORMAT (STRICT)\n"
+    "Return ONLY a JSON ARRAY.\n"
+    "Each element must follow this EXACT structure:\n\n"
+    "[\n"
+    "  {{\n"
+    "    \"employee_id\": string,\n"
+    "    \"name\": string | null,\n"
+    "    \"period_summaries\": [\n"
+    "      {{\n"
+    "        \"period_half\": string | null,\n"
+    "        \"overall_highlights\": string,\n"
+    "        \"kpi_summary\": string,\n"
+    "        \"trend_vs_previous\": \"improving\" | \"declining\" | \"stable\" | \"no_previous_data\",\n"
+    "        \"anomalies\": [string],\n"
+    "        \"manager_comment_original\": string | null,\n"
+    "        \"manager_comment_rewrite\": string | null\n"
+    "      }}\n"
+    "    ],\n"
+    "    \"bias_assessment\": {{\n"
+    "      \"manager_rating\": string | null,\n"
+    "      \"expected_rating\": string | null,\n"
+    "      \"comparison\": \"aligned\" | \"manager_slightly_high\" | \"manager_very_high\" | \"manager_slightly_low\" | \"manager_very_low\" | null\n"
+    "    }},\n"
+    "    \"future_performance\": {{\n"
+    "      \"predicted_rating\": string | null,\n"
+    "      \"confidence\": \"high\" | \"medium\" | \"low\",\n"
+    "      \"rationale\": string\n"
+    "    }},\n"
+    "    \"risk_signals\": [string],\n"
+    "    \"development_recommendations\": [string]\n"
+    "  }}\n"
+    "]\n\n"
+    "----------------------------------------------\n"
+    "RULES:\n"
+    "- Do NOT add markdown, comments, or explanation outside raw JSON\n"
+    "- Sort employees by employee_id\n"
+    "- Never hallucinate missing data — use null if not available\n"
+    "- All conclusions must be based on the provided compact KPIs\n"
 )
 
-# 🔴 NEW: build compact copy for GPT payload
-compact_reports = _build_compact_reports_for_gpt(manager_reports)
 
-# Only the compact version goes in the prompt
-reports_json = json.dumps(compact_reports, indent=2, default=str)
 
-tcm = TachyonChatManager()
-
-system_msg = {
-    "role": "system",
-    "content": MANAGER_INSIGHTS_SYSTEM_PROMPT,
-}
-
-user_content = MANAGER_INSIGHTS_USER_PROMPT_TEMPLATE.format(
-    manager_id=manager_id,
-    report_data=reports_json,
-)
-
-user_msg = {
-    "role": "user",
-    "content": user_content,
-}
