@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neural Architects - Solution Overview</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Calibri, Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 8.5in; /* Standard Letter width */
+            margin: 0 auto;
+            padding: 40px;
+            background-color: #ffffff;
+        }
+        h1 {
+            color: #d71e28; /* Wells Fargo Red-like shade for professional accent */
+            font-size: 28px;
+            border-bottom: 3px solid #d71e28;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        h2 {
+            color: #2e2e2e;
+            font-size: 22px;
+            margin-top: 35px;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 5px;
+        }
+        h3 {
+            color: #444;
+            font-size: 18px;
+            margin-top: 25px;
+            margin-bottom: 10px;
+        }
+        p {
+            margin-bottom: 15px;
+            text-align: justify;
+        }
+        ul {
+            margin-bottom: 15px;
+        }
+        li {
+            margin-bottom: 5px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+        th {
+            background-color: #f4f4f4;
+            color: #333;
+            font-weight: bold;
+            text-align: left;
+            padding: 10px;
+            border: 1px solid #ddd;
+        }
+        td {
+            padding: 10px;
+            border: 1px solid #ddd;
+            vertical-align: top;
+        }
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: Consolas, monospace;
+            font-size: 0.9em;
+            color: #c7254e;
+        }
+        .header-meta {
+            margin-bottom: 40px;
+            background-color: #f9f9f9;
+            padding: 15px;
+            border-left: 5px solid #555;
+        }
+        .footer {
+            margin-top: 60px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+            font-size: 12px;
+            color: #777;
+            text-align: center;
+        }
+        @media print {
+            body {
+                width: 100%;
+                margin: 0;
+                padding: 0;
+            }
+            .no-print {
+                display: none;
+            }
+            a {
+                text-decoration: none;
+                color: #000;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <h1>AI-Driven Performance Review Dashboard</h1>
+
+    <div class="header-meta">
+        <p><strong>Event:</strong> Wells Fargo HR-IT Hackathon 2025<br>
+        <strong>Team:</strong> Neural Architects<br>
+        <strong>Date:</strong> October 2025</p>
+    </div>
+
+    <h2>1. Executive Summary</h2>
+    <p><strong>"From Subjective Opinions to Data-Driven Intelligence."</strong></p>
+    <p>The <strong>Neural Architects’ Performance Review Dashboard</strong> is a Generative-AI powered solution designed to transform the engineering performance review process. By aggregating operational signals from disparate systems (Jira, GitHub, LMS) and validating them against manager sentiment, we create a fairer, more transparent, and growth-oriented evaluation system. This solution acts as a co-pilot for managers, reducing bias and automating the synthesis of complex performance data.</p>
+
+    <h2>2. Problem Statement</h2>
+    <p>Engineering managers face significant challenges when evaluating employee performance:</p>
+    <ul>
+        <li><strong>Data Fragmentation:</strong> Managers spend hours manually gathering inconsistent signals from Jira, GitHub, HR portals, and feedback forms.</li>
+        <li><strong>Unconscious Bias:</strong> Without a unified data view, ratings are often influenced by recency bias or subjective interpretation of "hard work."</li>
+        <li><strong>Lack of Actionability:</strong> Managers struggle to identify early warning signals (burnout, coasting) or provide data-backed justification for their ratings.</li>
+    </ul>
+    <p><strong>The Gap:</strong> There is currently no unified intelligence layer that transforms raw operational signals into fair, explainable, and future-focused performance assessments.</p>
+
+    <h2>3. The Complete Solution</h2>
+    <p><strong>This platform</strong> is not just a dashboard; it is a <strong>Gen-AI powered Performance Intelligence Platform</strong> that acts as an objective "Fairness Auditor" and "Co-Pilot" for engineering leadership.</p>
+    <p>The solution consists of three core engines working in unison:</p>
+    <ol>
+        <li><strong>The Unified ETL Engine:</strong> Automatically connects to Jira (Delivery), GitHub (Quality), LMS (Growth), and RTO logs to compute <strong>75+ productivity KPIs</strong> without manual intervention.</li>
+        <li><strong>The Bias Detection Engine:</strong> Mathematically compares the "Expected Rating" (derived from data) against the "Manager Rating" (subjective input) to flag discrepancies like favoritism or harshness.</li>
+        <li><strong>The Generative Narrative Engine:</strong> Leverages GPT (via Tachyon) to synthesize complex datasets into professional, empathetic, and actionable performance reviews, while predicting future career trajectories.</li>
+    </ol>
+
+    <h3>Core Capabilities & UX Features</h3>
+    <p>Our platform delivers a comprehensive suite of features designed to elevate the review process from a simple form-filling exercise to a strategic talent management session.</p>
+
+    <table>
+        <tr>
+            <th>Feature</th>
+            <th>Description</th>
+        </tr>
+        <tr>
+            <td><strong>📈 Interactive Analytics</strong></td>
+            <td>Line graphs for trends and bar charts for peer comparisons.</td>
+        </tr>
+        <tr>
+            <td><strong>🔄 H1/H2 Benchmarking</strong></td>
+            <td>Immediate toggles to compare first-half vs. second-half performance velocity.</td>
+        </tr>
+        <tr>
+            <td><strong>🧠 Smart Rewrites</strong></td>
+            <td>GenAI rewrites biased or brief manager comments into professional, constructive feedback.</td>
+        </tr>
+        <tr>
+            <td><strong>🚦 Bias Radar</strong></td>
+            <td>Visual indicators (Green/Yellow/Red) showing alignment between data and manager perception.</td>
+        </tr>
+        <tr>
+            <td><strong>🔮 Future Predictor</strong></td>
+            <td>Risk analysis identifying potential attrition or downward performance trends.</td>
+        </tr>
+        <tr>
+            <td><strong>📌 Executive Summary</strong></td>
+            <td>Auto-generated team-level insights for leadership consumption.</td>
+        </tr>
+    </table>
+
+    <h2>4. Technical Architecture</h2>
+    <p>The system follows a <strong>"Secure by Design"</strong> philosophy. No raw PII or CSV data leaves the secure backend. Only anonymized, structured contexts are transmitted to the LLM via the Tachyon Gateway.</p>
+
+    <h3>End-to-End Workflow</h3>
+    <ol>
+        <li><strong>Data Ingestion (Simulation Layer):</strong> Ingestion adapters read from the Data Lake (simulating live Jira/GitHub/LMS streams for the hackathon).</li>
+        <li><strong>ETL & Periodization:</strong> Data is cleaned, aligned to fiscal periods (H1/H2), and normalized.</li>
+        <li><strong>Feature Engineering:</strong> Raw signals are converted into weighted KPIs.</li>
+        <li><strong>Scoring Engine:</strong> An "Expected Score" (0-100) is calculated based on organizational weights.</li>
+        <li><strong>AI Inference (Tachyon):</strong> The system constructs a secure prompt. The LLM performs a fairness check, rewrites narratives, and generates insights.</li>
+        <li><strong>Delivery:</strong> Final insights are serialized into JSON for the Manager Dashboard.</li>
+    </ol>
+
+    <h2>5. Scoring Science: KPIs & Weights</h2>
+    <p>We do not guess performance; we calculate it. Our <strong>Expected Score (0–100)</strong> is derived from a weighted aggregation of 75+ normalized KPIs.</p>
+
+    <h3>A. Weighted Categories</h3>
+    <table>
+        <tr>
+            <th>Category</th>
+            <th>Weight</th>
+            <th>Description</th>
+        </tr>
+        <tr>
+            <td><strong>Delivery Execution</strong></td>
+            <td><strong>30%</strong></td>
+            <td>Velocity, predictability, and completion consistency.</td>
+        </tr>
+        <tr>
+            <td><strong>Quality & Stability</strong></td>
+            <td><strong>35%</strong></td>
+            <td>Code quality, bug density, and production impact.</td>
+        </tr>
+        <tr>
+            <td><strong>Collaboration</strong></td>
+            <td><strong>20%</strong></td>
+            <td>Peer reviews, teamwork signals, and recognition.</td>
+        </tr>
+        <tr>
+            <td><strong>Growth & Learning</strong></td>
+            <td><strong>15%</strong></td>
+            <td>Upskilling effort and goal completion.</td>
+        </tr>
+    </table>
+
+    <h3>B. Detailed KPI Dictionary</h3>
+    <table>
+        <tr>
+            <th>Category</th>
+            <th>KPI Name</th>
+            <th>Calculation</th>
+            <th>Why It Matters</th>
+        </tr>
+        <tr>
+            <td><strong>Delivery</strong></td>
+            <td><strong>Story Completion Ratio</strong></td>
+            <td><code>completed / committed</code></td>
+            <td>Measures reliability and planning accuracy.</td>
+        </tr>
+        <tr>
+            <td><strong>Quality</strong></td>
+            <td><strong>Defect Density</strong></td>
+            <td><code>defects / story_points</code></td>
+            <td>Quality of code per unit of work.</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td><strong>Escaped to Prod Rate</strong></td>
+            <td><code>prod_issues / total_defects</code></td>
+            <td>Critical measure of testing efficacy.</td>
+        </tr>
+        <tr>
+            <td><strong>Collaboration</strong></td>
+            <td><strong>PR Review Volume</strong></td>
+            <td><code>total_reviews_performed</code></td>
+            <td>Indicates contribution to team quality.</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td><strong>Feedback Sentiment</strong></td>
+            <td><code>positive - negative count</code></td>
+            <td>Behavioral signal from peers.</td>
+        </tr>
+        <tr>
+            <td><strong>Growth</strong></td>
+            <td><strong>IDP Goal Completion</strong></td>
+            <td><code>completed_goals / total</code></td>
+            <td>Accountability for personal development.</td>
+        </tr>
+        <tr>
+            <td><strong>Presence</strong></td>
+            <td><strong>RTO Compliance</strong></td>
+            <td><code>(actual / required) * 100</code></td>
+            <td>Adherence to workplace policy.</td>
+        </tr>
+    </table>
+
+    <h3>C. Rating Normalization (The 5-Level Scale)</h3>
+    <p>Outliers are auto-adjusted to maintain fairness before mapping to the final rating.</p>
+    <table>
+        <tr>
+            <th>Expected Score</th>
+            <th>Final Rating</th>
+        </tr>
+        <tr>
+            <td><strong>85 – 100</strong></td>
+            <td>🌟 <strong>Outstanding</strong></td>
+        </tr>
+        <tr>
+            <td><strong>65 – 84</strong></td>
+            <td>⭐ <strong>Exceeds Expectations</strong></td>
+        </tr>
+        <tr>
+            <td><strong>45 – 64</strong></td>
+            <td>👍 <strong>Meets Expectations</strong></td>
+        </tr>
+        <tr>
+            <td><strong>30 – 44</strong></td>
+            <td>⚠️ <strong>Needs Improvement</strong></td>
+        </tr>
+        <tr>
+            <td><strong>Below 30</strong></td>
+            <td>❌ <strong>Unsatisfactory</strong></td>
+        </tr>
+    </table>
+
+    <h2>6. The AI Engine: Bias & Trends</h2>
+    <p>We utilize Generative AI (GPT) strictly as an <strong>interpreter and auditor</strong>.</p>
+
+    <h3>A. Bias Detection Framework</h3>
+    <p>The system audits the delta between the <strong>Data-Driven Rating</strong> and the <strong>Manager's Subjective Rating</strong>.</p>
+    <table>
+        <tr>
+            <th>Difference (Manager vs Data)</th>
+            <th>Label</th>
+            <th>Implication</th>
+        </tr>
+        <tr>
+            <td><strong>Same Level</strong></td>
+            <td><code>aligned</code></td>
+            <td>✅ Fair Review</td>
+        </tr>
+        <tr>
+            <td><strong>Manager +1 Level</strong></td>
+            <td><code>manager_slightly_high</code></td>
+            <td>⚠️ Potential Favoritism/Recency Bias</td>
+        </tr>
+        <tr>
+            <td><strong>Manager +2/+3 Levels</strong></td>
+            <td><code>manager_very_high</code></td>
+            <td>🚩 <strong>Leniency Bias Risk (Flagged)</strong></td>
+        </tr>
+        <tr>
+            <td><strong>Manager -1 Level</strong></td>
+            <td><code>manager_slightly_low</code></td>
+            <td>⚠️ Potential Severity Bias</td>
+        </tr>
+        <tr>
+            <td><strong>Manager -2/-3 Levels</strong></td>
+            <td><code>manager_very_low</code></td>
+            <td>🚩 <strong>Severity Bias Risk (Flagged)</strong></td>
+        </tr>
+    </table>
+
+    <h3>B. Trend & Anomaly Detection</h3>
+    <p>The engine compares H1 vs H2 metrics to provide context:</p>
+    <ul>
+        <li><strong>Positive Trend:</strong> KPI increase > 10% (e.g., "Velocity improved by 15% in H2").</li>
+        <li><strong>Negative Trend:</strong> KPI decrease > 10% (e.g., "Quality dropped significantly in H2").</li>
+        <li><strong>Anomaly Flag:</strong> Sudden drops in sentiment or massive spikes in defects trigger <code>anomaly_flg = true</code>.</li>
+    </ul>
+
+    <h3>C. Why AI? (Pain vs. Fix)</h3>
+    <table>
+        <tr>
+            <th>Pain Point Today</th>
+            <th>The AI Fix</th>
+        </tr>
+        <tr>
+            <td>Managers rely on intuition</td>
+            <td>GPT uses KPIs + trends to justify insights</td>
+        </tr>
+        <tr>
+            <td>Hard to explain bias</td>
+            <td>Data-aligned audit of ratings</td>
+        </tr>
+        <tr>
+            <td>Poor visibility into team health</td>
+            <td>Automatic executive dashboards</td>
+        </tr>
+        <tr>
+            <td>Harsh/Brief Comments</td>
+            <td>Smart rewrites for tone and professionalism</td>
+        </tr>
+    </table>
+
+    <h2>7. Artifacts & Deliverables</h2>
+    <p>The system produces structured outputs ready for UI consumption:</p>
+    <ul>
+        <li><code>report_cards_all.json</code>: Complete factual HR signals per employee.</li>
+        <li><code>features_by_period.json</code>: H1 vs H2 KPI matrix for trending.</li>
+        <li><code>manager_&lt;id&gt;_insights.json</code>: AI-generated individual employee narratives.</li>
+        <li><code>manager_&lt;id&gt;_overall_insights.json</code>: Team-level strategic guidance and health check.</li>
+    </ul>
+
+    <h2>8. Business Impact</h2>
+    <ul>
+        <li><strong>Efficiency:</strong> Reduces manager evaluation time by <strong>~70%</strong>.</li>
+        <li><strong>Fairness:</strong> Eliminates unconscious bias through data-backed validation.</li>
+        <li><strong>Transparency:</strong> Provides a fully traceable audit trail.</li>
+        <li><strong>Retention:</strong> Identifies "Flight Risks" and "Burnout" early.</li>
+    </ul>
+
+    <h2>9. Future Roadmap</h2>
+    <ul>
+        <li><strong>Real-Time Integration:</strong> Transition from simulated CSV ingestion to live, secure API connectors for Jira, Workday, and GitHub.</li>
+        <li><strong>Configurable Scoring:</strong> Enable dynamic weighting adjustment to support diverse business units (e.g., QA vs. Dev vs. Product).</li>
+        <li><strong>Interactive Intelligence:</strong> Implement an "Ask Data" chat interface, allowing managers to query specific team metrics and trends on demand.</li>
+    </ul>
+
+    <h2>10. Conclusion</h2>
+    <p><strong>Neural Architects</strong> transforms scattered raw performance signals into a fair, objective, and data-driven intelligence system. By positioning AI as an impartial interpreter rather than a judge, we empower Engineering Managers to make talent decisions that are accurate, transparent, and equitable.</p>
+
+    <h2>11. Team: Neural Architects</h2>
+    <ul>
+        <li><strong>Adwait Vipra</strong></li>
+        <li><strong>Govindraj Joshi</strong></li>
+        <li><strong>Lalit Mangal</strong></li>
+        <li><strong>Mrutyunjaya Beura</strong></li>
+        <li><strong>Vanshika Nehra</strong></li>
+    </ul>
+
+    <div class="footer">
+        <p>© 2025 Neural Architects. Submitted for Wells Fargo HR-IT Hackathon.</p>
+    </div>
+
+</body>
+</html>
